@@ -14,7 +14,9 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/config"
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	api "github.com/vinhpnguyen123/ticketqueue/internal/http"
+	"github.com/vinhpnguyen123/ticketqueue/internal/redis"
 )
 
 func main() {
@@ -27,18 +29,35 @@ func main() {
 		os.Exit(1)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := db.NewPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("postgres unreachable", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+	logger.Info("connected to postgres")
+
+	rdb, err := redis.NewClient(ctx, cfg.RedisAddr)
+	if err != nil {
+		logger.Error("redis unreachable", "error", err)
+		os.Exit(1)
+	}
+	defer rdb.Close()
+	logger.Info("connected to redis")
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recoverer)
 	r.Get("/v1/health", api.HealthHandler)
+	r.Get("/v1/health/ready", api.ReadyHandler(
+		pool.Ping,
+		func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
+	))
 
-	srv := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: r,
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 
 	go func() {
 		logger.Info("api server listening", "addr", srv.Addr)
