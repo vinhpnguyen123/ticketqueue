@@ -59,6 +59,7 @@ func main() {
 		func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
 	))
 	api.NewAuthHandler(pool, cfg.JWTSecret).Mount(r)
+	api.NewEventsHandler(pool).Mount(r)
 
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 

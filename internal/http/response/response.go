@@ -16,6 +16,18 @@ type dataEnvelope struct {
 	RequestID string `json:"request_id"`
 }
 
+// Pagination describes cursor pagination for list responses.
+type Pagination struct {
+	NextCursor *string `json:"next_cursor"`
+	HasMore    bool    `json:"has_more"`
+}
+
+type listEnvelope struct {
+	Data       any        `json:"data"`
+	Pagination Pagination `json:"pagination"`
+	RequestID  string     `json:"request_id"`
+}
+
 type errorEnvelope struct {
 	Error errorBody `json:"error"`
 }
@@ -32,6 +44,16 @@ func JSON(w http.ResponseWriter, r *http.Request, status int, data any) {
 	write(w, r, status, dataEnvelope{
 		Data:      data,
 		RequestID: middleware.GetReqID(r.Context()),
+	})
+}
+
+// List writes a paginated success envelope:
+// {"data": [...], "pagination": {...}, "request_id": "..."}.
+func List(w http.ResponseWriter, r *http.Request, status int, data any, p Pagination) {
+	write(w, r, status, listEnvelope{
+		Data:       data,
+		Pagination: p,
+		RequestID:  middleware.GetReqID(r.Context()),
 	})
 }
 

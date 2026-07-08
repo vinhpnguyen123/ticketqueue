@@ -42,6 +42,30 @@ func TestJSON(t *testing.T) {
 	}
 }
 
+func TestList(t *testing.T) {
+	w := httptest.NewRecorder()
+	cursor := "abc-cursor"
+	List(w, newRequest("req-list"), http.StatusOK, []int{1, 2}, Pagination{NextCursor: &cursor, HasMore: true})
+
+	var body struct {
+		Data       []int `json:"data"`
+		Pagination struct {
+			NextCursor *string `json:"next_cursor"`
+			HasMore    bool    `json:"has_more"`
+		} `json:"pagination"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(body.Data) != 2 || !body.Pagination.HasMore || body.Pagination.NextCursor == nil || *body.Pagination.NextCursor != "abc-cursor" {
+		t.Errorf("body = %+v", body)
+	}
+	if body.RequestID != "req-list" {
+		t.Errorf("request_id = %q", body.RequestID)
+	}
+}
+
 func TestError(t *testing.T) {
 	w := httptest.NewRecorder()
 	Error(w, newRequest("req-456"), http.StatusNotFound, "not_found", "booking not found")
