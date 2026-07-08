@@ -16,6 +16,7 @@ import (
 	"github.com/vinhpnguyen123/ticketqueue/internal/config"
 	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	api "github.com/vinhpnguyen123/ticketqueue/internal/http"
+	apimw "github.com/vinhpnguyen123/ticketqueue/internal/http/middleware"
 	"github.com/vinhpnguyen123/ticketqueue/internal/redis"
 )
 
@@ -50,6 +51,7 @@ func main() {
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	r.Use(apimw.RequestLogger(logger))
 	r.Use(middleware.Recoverer)
 	r.Get("/v1/health", api.HealthHandler)
 	r.Get("/v1/health/ready", api.ReadyHandler(
