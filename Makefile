@@ -1,6 +1,6 @@
 DATABASE_URL ?= postgres://ticketqueue:localdev@localhost:5434/ticketqueue?sslmode=disable
 
-.PHONY: up down run logs psql migrate-up migrate-down test
+.PHONY: up down run logs psql migrate-up migrate-down test seed
 
 up:
 	docker compose up -d
@@ -25,3 +25,6 @@ migrate-down:
 
 test:
 	go test ./...
+
+seed:
+	go run ./cmd/seed
