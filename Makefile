@@ -38,8 +38,10 @@ migrate-test-down:
 test:
 	go test ./...
 
+# -p 1: integration packages share one test DB and Redis index, so they
+# must not run in parallel (one package's TRUNCATE would wipe another's rows).
 test-integration:
-	go test -tags=integration ./...
+	go test -tags=integration -p 1 ./...
 
 seed:
 	go run ./cmd/seed

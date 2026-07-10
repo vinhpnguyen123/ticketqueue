@@ -41,6 +41,34 @@ func GenerateToken(userID, email string, isAdmin bool, secret string, ttl time.D
 	return signed, nil
 }
 
+// PurchaseClaims are the claims of a purchase token issued to an admitted
+// queue member. The purchase endpoint validates it in Week 3.
+type PurchaseClaims struct {
+	EventID    string `json:"event_id"`
+	AdmittedAt int64  `json:"admitted_at"`
+	jwt.RegisteredClaims
+}
+
+// GeneratePurchaseToken issues an HS256 JWT proving the user was admitted
+// from the queue; it expires when their purchase window closes.
+func GeneratePurchaseToken(userID, eventID string, admittedAt time.Time, windowSeconds int, secret string) (string, error) {
+	claims := PurchaseClaims{
+		EventID:    eventID,
+		AdmittedAt: admittedAt.Unix(),
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   userID,
+			IssuedAt:  jwt.NewNumericDate(admittedAt),
+			ExpiresAt: jwt.NewNumericDate(admittedAt.Add(time.Duration(windowSeconds) * time.Second)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("sign purchase token: %w", err)
+	}
+	return signed, nil
+}
+
 // ParseToken validates an HS256 JWT and returns its claims.
 func ParseToken(tokenString, secret string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{},
