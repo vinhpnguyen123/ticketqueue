@@ -1,7 +1,7 @@
 DATABASE_URL ?= postgres://ticketqueue:localdev@localhost:5434/ticketqueue?sslmode=disable
 TEST_DATABASE_URL ?= postgres://ticketqueue:localdev@localhost:5434/ticketqueue_test?sslmode=disable
 
-.PHONY: up down run run-worker logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed
+.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed
 
 up:
 	docker compose up -d
@@ -14,6 +14,9 @@ run:
 
 run-worker:
 	go run ./cmd/worker
+
+run-payments:
+	PAYMENT_PORT=8081 go run ./cmd/payment-service
 
 logs:
 	docker compose logs -f
