@@ -1,11 +1,51 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/vinhpnguyen123/ticketqueue/internal/config"
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
+	"github.com/vinhpnguyen123/ticketqueue/internal/redis"
+	"github.com/vinhpnguyen123/ticketqueue/internal/worker"
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	logger.Info("worker started")
+	slog.SetDefault(logger)
+
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := db.NewPool(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("postgres unreachable", "error", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+	logger.Info("connected to postgres")
+
+	rdb, err := redis.NewClient(ctx, cfg.RedisAddr)
+	if err != nil {
+		logger.Error("redis unreachable", "error", err)
+		os.Exit(1)
+	}
+	defer rdb.Close()
+	logger.Info("connected to redis")
+
+	// Start blocks until SIGINT/SIGTERM cancels ctx.
+	worker.NewRunner("promotion", worker.PromotionInterval, func(ctx context.Context) error {
+		return worker.PromoteCycle(ctx, rdb, pool)
+	}).Start(ctx)
+
+	logger.Info("shutdown complete")
 }
