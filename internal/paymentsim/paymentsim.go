@@ -24,6 +24,10 @@ var (
 	slow30s = 30 * time.Second
 )
 
+// SetTestDelays overrides both slow-token sleeps. Test-only: lets integration
+// tests provoke a client timeout without a real 30s wait.
+func SetTestDelays(d time.Duration) { slow5s, slow30s = d, d }
+
 type card struct {
 	Brand string `json:"brand"`
 	Last4 string `json:"last4"`

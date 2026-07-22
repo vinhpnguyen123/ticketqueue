@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // PaymentClient talks to the (simulated) payment provider.
@@ -26,11 +24,34 @@ func NewPaymentClient(baseURL, apiKey string) *PaymentClient {
 	return &PaymentClient{BaseURL: baseURL, APIKey: apiKey, HTTP: &http.Client{Timeout: 3 * time.Second}}
 }
 
-// Charge POSTs to the provider with the booking's idempotency key.
-// A non-nil error means we don't know the outcome (timeout, dropped
-// response); a nil error with empty txnID means the provider answered
-// with a non-charge response.
-func (c *PaymentClient) Charge(ctx context.Context, idemKey string, amountCents int64, currency, paymentToken string) (txnID string, err error) {
+// Outcome classifies a charge attempt into the three cases TX2 branches on.
+type Outcome int
+
+const (
+	// Ambiguous: we don't know if money moved (timeout, dropped connection,
+	// 5xx, unparseable body). Never guess — leave the booking held for
+	// reconciliation. This is the zero value on purpose: any early return
+	// without a definitive provider answer is ambiguous.
+	Ambiguous Outcome = iota
+	Succeeded          // provider confirmed the charge (HTTP 200, status succeeded)
+	Declined           // provider refused the card (HTTP 402, status failed)
+)
+
+// ChargeResult is everything TX2 needs to finalize, with the outcome already
+// classified so the money-path branching lives in one place.
+type ChargeResult struct {
+	Outcome     Outcome
+	TxnID       string
+	CardBrand   string
+	CardLast4   string
+	FailureCode string
+	Raw         []byte // provider's raw JSON body → payments.provider_response
+}
+
+// Charge POSTs to the provider with the booking's idempotency key and
+// classifies the result. It never returns an error: an unreachable or
+// ambiguous provider is a valid, expected outcome (Ambiguous), not a bug.
+func (c *PaymentClient) Charge(ctx context.Context, idemKey string, amountCents int64, currency, paymentToken string) ChargeResult {
 	body, _ := json.Marshal(map[string]any{
 		"amount":        amountCents,
 		"currency":      currency,
@@ -39,7 +60,7 @@ func (c *PaymentClient) Charge(ctx context.Context, idemKey string, amountCents 
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/charges", bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return ChargeResult{Outcome: Ambiguous}
 	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	req.Header.Set("Idempotency-Key", idemKey)
@@ -47,38 +68,38 @@ func (c *PaymentClient) Charge(ctx context.Context, idemKey string, amountCents 
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("charge request: %w", err)
+		// Timeout / dropped connection / reset: money may or may not have
+		// moved. Never log the payment token. Reconciliation resolves this.
+		slog.Warn("payment outcome unknown", "error", err)
+		return ChargeResult{Outcome: Ambiguous}
 	}
 	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
 
-	var out struct {
-		ID string `json:"id"`
+	var ch struct {
+		ID          string `json:"id"`
+		Status      string `json:"status"`
+		FailureCode string `json:"failure_code"`
+		Card        struct {
+			Brand string `json:"brand"`
+			Last4 string `json:"last4"`
+		} `json:"card"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", fmt.Errorf("decode charge response (status %d): %w", resp.StatusCode, err)
-	}
-	return out.ID, nil
-}
 
-// InitiatePayment is the WEEK4 temporary seam: call the provider, record an
-// 'initiated' payments row, and stop — every outcome (success, decline,
-// timeout, dropped response) is treated the same. TX2 replaces this with
-// real finalization: confirmed/failed booking, payments status, sold tickets.
-func InitiatePayment(ctx context.Context, pool *pgxpool.Pool, pc *PaymentClient, held Held, idemKey, paymentToken string) {
-	txnID, err := pc.Charge(ctx, idemKey, held.TotalCents, held.Currency, paymentToken)
-	if err != nil {
-		// Outcome unknown — exactly the ambiguity reconciliation resolves.
-		// Never log the payment token itself.
-		slog.Warn("payment outcome unknown", "booking_id", held.BookingID, "error", err)
-	}
-	var txn *string
-	if txnID != "" {
-		txn = &txnID
-	}
-	if _, err := pool.Exec(ctx,
-		`INSERT INTO payments (booking_id, provider, provider_txn_id, status, amount_cents, currency)
-		 VALUES ($1, 'simulated', $2, 'initiated', $3, $4)`,
-		held.BookingID, txn, held.TotalCents, held.Currency); err != nil {
-		slog.Error("insert payments row", "booking_id", held.BookingID, "error", err)
+	switch resp.StatusCode {
+	case http.StatusOK:
+		if json.Unmarshal(raw, &ch) != nil || ch.Status != "succeeded" {
+			return ChargeResult{Outcome: Ambiguous, Raw: raw}
+		}
+		return ChargeResult{Outcome: Succeeded, TxnID: ch.ID,
+			CardBrand: ch.Card.Brand, CardLast4: ch.Card.Last4, Raw: raw}
+	case http.StatusPaymentRequired:
+		_ = json.Unmarshal(raw, &ch)
+		return ChargeResult{Outcome: Declined, TxnID: ch.ID, FailureCode: ch.FailureCode, Raw: raw}
+	default:
+		// 500 and anything else: no idempotency guarantee that a charge
+		// exists. Treat as ambiguous (case D); reconciliation will find the
+		// provider has no record and fail it cleanly.
+		return ChargeResult{Outcome: Ambiguous, Raw: raw}
 	}
 }

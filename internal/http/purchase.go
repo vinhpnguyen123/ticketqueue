@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -158,15 +159,59 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	idempotency.SetBookingID(r, held.BookingID)
+	// --- End PHASE 1 (TX1). All row locks released at COMMIT above. ---
 
-	// WEEK4: replace with full TX2 — finalize booking confirmed/failed from
-	// the payment result, write real payment status, flip tickets held→sold.
-	// For now: initiate the charge, record it, and report the hold.
-	booking.InitiatePayment(r.Context(), h.pool, h.payments, held, idemKey, req.PaymentToken)
+	// --- PHASE 2: the payment call. NO DB transaction is open here — we never
+	// hold locks across a network call. Charge classifies every outcome
+	// (succeeded / declined / ambiguous) so PHASE 3 branches in one place.
+	charge := h.payments.Charge(r.Context(), idemKey, held.TotalCents, held.Currency, req.PaymentToken)
 
-	response.JSON(w, r, http.StatusAccepted, map[string]any{
-		"booking_id": held.BookingID,
-		"status":     "held",
-		"message":    "payment processing",
-	})
+	// --- PHASE 3: TX2 finalization based on the payment outcome.
+	reqID := middleware.GetReqID(r.Context())
+	fin, err := booking.Finalize(r.Context(), h.pool, held, tier.ID, userID, reqID, charge)
+	if err != nil {
+		slog.Error("purchase: TX2 finalize failed", "booking_id", held.BookingID, "error", err)
+		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to finalize purchase")
+		return
+	}
+
+	switch fin.Status {
+	case "confirmed":
+		response.JSON(w, r, http.StatusCreated, map[string]any{
+			"booking_id": held.BookingID,
+			"status":     "confirmed",
+			"tickets":    fin.Tickets,
+			"reference":  reference(held.BookingID),
+		})
+	case "failed":
+		// Tickets released inside TX2; give the inventory back to Redis AFTER
+		// commit, never inside the transaction. ReleaseQty is 0 when the expiry
+		// worker already compensated (the lost-guard race).
+		if fin.ReleaseQty > 0 {
+			if cerr := booking.CompensateInventory(r.Context(), h.rdb, tier.ID, fin.ReleaseQty); cerr != nil {
+				slog.Error("purchase: decline inventory compensation failed (drift checker will heal)",
+					"tier_id", tier.ID, "qty", fin.ReleaseQty, "error", cerr)
+			}
+		}
+		response.ErrorWithDetails(w, r, http.StatusPaymentRequired, "payment_declined",
+			"your card was declined", map[string]any{"booking_id": held.BookingID})
+	case "held_unknown":
+		// Booking stays 'held' as durable evidence; the reconciliation worker
+		// resolves it by querying the provider by idempotency key. We NEVER guess.
+		response.ErrorWithDetails(w, r, http.StatusGatewayTimeout, "payment_processing_unclear",
+			"payment is being verified, check booking status", map[string]any{"booking_id": held.BookingID})
+	case "expired_after_charge":
+		// Money moved but the hold had already expired. Recorded for refund.
+		response.ErrorWithDetails(w, r, http.StatusConflict, "booking_expired_after_charge",
+			"your hold expired while payment was processing; a refund will be issued",
+			map[string]any{"booking_id": held.BookingID})
+	default:
+		slog.Error("purchase: unknown finalize status", "status", fin.Status, "booking_id", held.BookingID)
+		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to finalize purchase")
+	}
+}
+
+// reference is the human-facing booking reference derived from the booking id.
+func reference(bookingID string) string {
+	return "TQ-" + strings.ToUpper(bookingID[:8])
 }
