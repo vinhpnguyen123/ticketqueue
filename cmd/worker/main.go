@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/config"
@@ -42,10 +43,24 @@ func main() {
 	defer rdb.Close()
 	logger.Info("connected to redis")
 
-	// Start blocks until SIGINT/SIGTERM cancels ctx.
-	worker.NewRunner("promotion", worker.PromotionInterval, func(ctx context.Context) error {
-		return worker.PromoteCycle(ctx, rdb, pool)
-	}).Start(ctx)
+	// Each Runner blocks until SIGINT/SIGTERM cancels ctx.
+	var wg sync.WaitGroup
+	runners := []*worker.Runner{
+		worker.NewRunner("promotion", worker.PromotionInterval, func(ctx context.Context) error {
+			return worker.PromoteCycle(ctx, rdb, pool)
+		}),
+		worker.NewRunner("idem-cleanup", worker.IdemCleanupInterval, func(ctx context.Context) error {
+			return worker.IdemCleanupCycle(ctx, pool)
+		}),
+	}
+	for _, r := range runners {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.Start(ctx)
+		}()
+	}
+	wg.Wait()
 
 	logger.Info("shutdown complete")
 }
