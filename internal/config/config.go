@@ -9,6 +9,8 @@ type Config struct {
 	RedisAddr   string
 	Port        string
 	JWTSecret   string
+	PaymentURL  string
+	PaymentKey  string
 }
 
 // Load reads configuration from the environment, applying local-dev
@@ -21,6 +23,8 @@ func Load() (Config, error) {
 		RedisAddr:   getenv("REDIS_ADDR", "localhost:6379"),
 		Port:        getenv("PORT", "8080"),
 		JWTSecret:   getenv("JWT_SECRET", "change-me-in-real-env"),
+		PaymentURL:  getenv("PAYMENT_URL", "http://localhost:8081"),
+		PaymentKey:  getenv("PAYMENT_API_KEY", "ps_test_localdev"),
 	}
 	return cfg, nil
 }

@@ -52,6 +52,9 @@ func main() {
 		worker.NewRunner("idem-cleanup", worker.IdemCleanupInterval, func(ctx context.Context) error {
 			return worker.IdemCleanupCycle(ctx, pool)
 		}),
+		worker.NewRunner("hold-expiry", worker.HoldExpiryInterval, func(ctx context.Context) error {
+			return worker.HoldExpiryCycle(ctx, rdb, pool)
+		}),
 	}
 	for _, r := range runners {
 		wg.Add(1)

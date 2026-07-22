@@ -69,6 +69,27 @@ func GeneratePurchaseToken(userID, eventID string, admittedAt time.Time, windowS
 	return signed, nil
 }
 
+// ParsePurchaseToken validates a purchase token and returns its claims.
+// Expired tokens return ErrTokenExpired so callers can distinguish
+// "window closed" (410) from "forged/wrong token" (401).
+func ParsePurchaseToken(tokenString, secret string) (*PurchaseClaims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &PurchaseClaims{},
+		func(t *jwt.Token) (any, error) { return []byte(secret), nil },
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+	)
+	if err != nil {
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			return nil, ErrTokenExpired
+		}
+		return nil, fmt.Errorf("%w: %v", ErrTokenInvalid, err)
+	}
+	claims, ok := token.Claims.(*PurchaseClaims)
+	if !ok || !token.Valid {
+		return nil, ErrTokenInvalid
+	}
+	return claims, nil
+}
+
 // ParseToken validates an HS256 JWT and returns its claims.
 func ParseToken(tokenString, secret string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{},

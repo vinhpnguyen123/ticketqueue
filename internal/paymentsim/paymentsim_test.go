@@ -1,4 +1,4 @@
-package main
+package paymentsim
 
 import (
 	"bytes"
@@ -21,7 +21,7 @@ func init() {
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(newServer(testKey))
+	ts := httptest.NewServer(NewServer(testKey))
 	t.Cleanup(ts.Close)
 	return ts
 }

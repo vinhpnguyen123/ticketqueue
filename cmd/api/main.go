@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
 	"github.com/vinhpnguyen123/ticketqueue/internal/config"
 	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	api "github.com/vinhpnguyen123/ticketqueue/internal/http"
@@ -61,6 +62,8 @@ func main() {
 	api.NewAuthHandler(pool, rdb, cfg.JWTSecret).Mount(r)
 	api.NewEventsHandler(pool).Mount(r)
 	api.NewQueueHandler(pool, rdb, cfg.JWTSecret).Mount(r)
+	api.NewPurchaseHandler(pool, rdb, cfg.JWTSecret,
+		booking.NewPaymentClient(cfg.PaymentURL, cfg.PaymentKey)).Mount(r)
 
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 
