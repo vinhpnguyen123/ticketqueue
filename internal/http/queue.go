@@ -16,6 +16,7 @@ import (
 	"github.com/vinhpnguyen123/ticketqueue/internal/domain/event"
 	"github.com/vinhpnguyen123/ticketqueue/internal/http/response"
 	"github.com/vinhpnguyen123/ticketqueue/internal/queue"
+	"github.com/vinhpnguyen123/ticketqueue/internal/ratelimit"
 )
 
 // QueueHandler serves the virtual-queue endpoints (all auth-required).
@@ -34,8 +35,10 @@ func NewQueueHandler(pool *pgxpool.Pool, rdb *redis.Client, secret string) *Queu
 func (h *QueueHandler) Mount(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		r.Use(auth.Middleware(h.secret))
-		r.Post("/v1/events/{id}/queue/join", h.Join)
-		r.Get("/v1/events/{id}/queue/position", h.Position)
+		r.With(ratelimit.Limit(h.rdb, "queue_join", 10, ratelimit.ByUserID)).
+			Post("/v1/events/{id}/queue/join", h.Join)
+		r.With(ratelimit.Limit(h.rdb, "queue_position", 30, ratelimit.ByUserID)).
+			Get("/v1/events/{id}/queue/position", h.Position)
 		r.Post("/v1/events/{id}/queue/leave", h.Leave)
 	})
 }

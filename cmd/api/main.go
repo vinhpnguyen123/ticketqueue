@@ -58,7 +58,7 @@ func main() {
 		pool.Ping,
 		func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
 	))
-	api.NewAuthHandler(pool, cfg.JWTSecret).Mount(r)
+	api.NewAuthHandler(pool, rdb, cfg.JWTSecret).Mount(r)
 	api.NewEventsHandler(pool).Mount(r)
 	api.NewQueueHandler(pool, rdb, cfg.JWTSecret).Mount(r)
 

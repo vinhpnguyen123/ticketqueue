@@ -11,10 +11,12 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/auth"
 	"github.com/vinhpnguyen123/ticketqueue/internal/domain/user"
 	"github.com/vinhpnguyen123/ticketqueue/internal/http/response"
+	"github.com/vinhpnguyen123/ticketqueue/internal/ratelimit"
 )
 
 // TokenTTL is how long issued JWTs stay valid.
@@ -37,17 +39,20 @@ var fakeHash = func() string {
 type AuthHandler struct {
 	users  *user.Repo
 	pool   *pgxpool.Pool
+	rdb    *redis.Client
 	secret string
 }
 
-func NewAuthHandler(pool *pgxpool.Pool, secret string) *AuthHandler {
-	return &AuthHandler{users: user.NewRepo(pool), pool: pool, secret: secret}
+func NewAuthHandler(pool *pgxpool.Pool, rdb *redis.Client, secret string) *AuthHandler {
+	return &AuthHandler{users: user.NewRepo(pool), pool: pool, rdb: rdb, secret: secret}
 }
 
 // Mount registers the auth routes on r; /v1/me goes behind the JWT middleware.
 func (h *AuthHandler) Mount(r chi.Router) {
-	r.Post("/v1/auth/register", h.Register)
-	r.Post("/v1/auth/login", h.Login)
+	r.With(ratelimit.Limit(h.rdb, "register", 3, ratelimit.ByIP)).
+		Post("/v1/auth/register", h.Register)
+	r.With(ratelimit.Limit(h.rdb, "login", 5, ratelimit.ByIP)).
+		Post("/v1/auth/login", h.Login)
 	r.Group(func(r chi.Router) {
 		r.Use(auth.Middleware(h.secret))
 		r.Get("/v1/me", h.Me)

@@ -26,10 +26,11 @@ const testSecret = "integration-test-secret"
 func newTestServer(t *testing.T) (*httptest.Server, *testServerDeps) {
 	t.Helper()
 	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	api.NewAuthHandler(pool, testSecret).Mount(r)
+	api.NewAuthHandler(pool, rdb, testSecret).Mount(r)
 
 	ts := httptest.NewServer(r)
 	t.Cleanup(ts.Close)

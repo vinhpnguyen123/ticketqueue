@@ -30,7 +30,7 @@ func newQueueServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Clien
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	api.NewAuthHandler(pool, testSecret).Mount(r)
+	api.NewAuthHandler(pool, rdb, testSecret).Mount(r)
 	api.NewQueueHandler(pool, rdb, testSecret).Mount(r)
 
 	ts := httptest.NewServer(r)
