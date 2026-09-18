@@ -70,3 +70,6 @@ sequence of events:
 
 Together those two queries are the whole promise of the system, expressed as
 SQL.
+
+**429 on back-to-back runs:** register is rate-limited to 3 per window per IP.
+Wait for the window to reset, or run against a fresh Redis (`docker compose restart redis`).
