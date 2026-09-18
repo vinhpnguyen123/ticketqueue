@@ -8,6 +8,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
 	"github.com/vinhpnguyen123/ticketqueue/internal/config"
 	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	"github.com/vinhpnguyen123/ticketqueue/internal/redis"
@@ -43,6 +44,8 @@ func main() {
 	defer rdb.Close()
 	logger.Info("connected to redis")
 
+	payments := booking.NewPaymentClient(cfg.PaymentURL, cfg.PaymentKey)
+
 	// Each Runner blocks until SIGINT/SIGTERM cancels ctx.
 	var wg sync.WaitGroup
 	runners := []*worker.Runner{
@@ -54,6 +57,9 @@ func main() {
 		}),
 		worker.NewRunner("hold-expiry", worker.HoldExpiryInterval, func(ctx context.Context) error {
 			return worker.HoldExpiryCycle(ctx, rdb, pool)
+		}),
+		worker.NewRunner("reconciliation", worker.ReconcileInterval, func(ctx context.Context) error {
+			return worker.ReconcileCycle(ctx, rdb, pool, payments)
 		}),
 	}
 	for _, r := range runners {

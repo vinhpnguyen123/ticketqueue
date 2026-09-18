@@ -8,6 +8,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Actor is who caused a state change, for audit_log. Type is one of
+// 'user' | 'worker' | 'system' | 'admin'; UserID and RequestID are written as
+// NULL when empty (a worker has neither).
+type Actor struct {
+	Type      string
+	UserID    string
+	RequestID string
+}
+
 // Finalized is TX2's outcome, mapped by the handler to an HTTP response.
 type Finalized struct {
 	// Status is one of:
@@ -22,6 +31,102 @@ type Finalized struct {
 	// nothing was released (confirmed, ambiguous, or the expiry-won race where
 	// the expiry worker already compensated).
 	ReleaseQty int
+}
+
+// ConfirmBooking is the shared confirm path: TX2, the reconciliation worker,
+// and (later) admin manual reconcile all go through it, so "money moved" is
+// written to the database in exactly one place.
+//
+// The guarded UPDATE is the whole safety story. applied=false means the
+// booking was no longer 'held' — the expiry worker or a sibling reconcile
+// already resolved it — and NOTHING further is written, because the caller
+// decides what that means: TX2 records a reconciliation_needed payment, the
+// worker just skips.
+//
+// Caller supplies the transaction; this never commits and never touches Redis.
+func ConfirmBooking(ctx context.Context, tx pgx.Tx, held Held, r ChargeResult, a Actor) (ticketIDs []string, applied bool, err error) {
+	tag, err := tx.Exec(ctx,
+		`UPDATE booking SET status = 'confirmed', confirmed_at = NOW(), version = version + 1
+		 WHERE id = $1 AND status = 'held'`, held.BookingID)
+	if err != nil {
+		return nil, false, fmt.Errorf("confirm booking: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, false, nil
+	}
+
+	// Only tickets this booking still holds; a ticket already flipped elsewhere
+	// is not ours to sell.
+	rows, err := tx.Query(ctx,
+		`UPDATE tickets SET status = 'sold'
+		 WHERE booking_id = $1 AND status = 'held' RETURNING id`, held.BookingID)
+	if err != nil {
+		return nil, false, fmt.Errorf("sell tickets: %w", err)
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, false, fmt.Errorf("scan sold ticket: %w", err)
+		}
+		ticketIDs = append(ticketIDs, id)
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		return nil, false, fmt.Errorf("iterate sold tickets: %w", rows.Err())
+	}
+
+	if err := insertSucceededPayment(ctx, tx, held, r); err != nil {
+		return nil, false, err
+	}
+	for _, action := range []string{"booking_confirmed", "payment_succeeded"} {
+		if err := audit(ctx, tx, held.BookingID, action, a, nil); err != nil {
+			return nil, false, err
+		}
+	}
+	return ticketIDs, true, nil
+}
+
+// FailBooking is the shared fail path: release the hold, record the attempt.
+// Like ConfirmBooking it only REPORTS a lost guard (applied=false) and writes
+// nothing in that case.
+//
+// r is the provider's answer, or nil when no charge ever reached the provider
+// (a 404 by-key lookup). nil → no payments row: a payments row must represent a
+// real attempt that reached the provider.
+//
+// releasedQty is what the caller must INCRBY back into Redis AFTER commit.
+func FailBooking(ctx context.Context, tx pgx.Tx, held Held, reason string, r *ChargeResult, a Actor) (releasedQty int, applied bool, err error) {
+	tag, err := tx.Exec(ctx,
+		`UPDATE booking SET status = 'failed', failed_at = NOW(), version = version + 1
+		 WHERE id = $1 AND status = 'held'`, held.BookingID)
+	if err != nil {
+		return 0, false, fmt.Errorf("fail booking: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return 0, false, nil
+	}
+
+	// Only 'held' tickets go back; a ticket already flipped to 'sold' belongs
+	// to a paid customer and must never be released.
+	rt, err := tx.Exec(ctx,
+		`UPDATE tickets SET status = 'available', booking_id = NULL
+		 WHERE booking_id = $1 AND status = 'held'`, held.BookingID)
+	if err != nil {
+		return 0, false, fmt.Errorf("release tickets: %w", err)
+	}
+	releasedQty = int(rt.RowsAffected())
+
+	if r != nil {
+		if err := insertFailedPayment(ctx, tx, held, *r); err != nil {
+			return 0, false, err
+		}
+	}
+	if err := audit(ctx, tx, held.BookingID, "booking_failed", a,
+		map[string]any{"reason": reason, "tickets_released": releasedQty}); err != nil {
+		return 0, false, err
+	}
+	return releasedQty, true, nil
 }
 
 // Finalize is PHASE 3 / TX2: it turns a classified ChargeResult into a durable
@@ -67,11 +172,9 @@ func recordUnknown(ctx context.Context, pool *pgxpool.Pool, held Held, requestID
 		held.BookingID, held.TotalCents, held.Currency); err != nil {
 		return Finalized{}, fmt.Errorf("insert unknown payment: %w", err)
 	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, request_id)
-		 VALUES ('booking', $1, 'payment_outcome_unknown', 'system', $2)`,
-		held.BookingID, requestID); err != nil {
-		return Finalized{}, fmt.Errorf("audit unknown: %w", err)
+	if err := audit(ctx, tx, held.BookingID, "payment_outcome_unknown",
+		Actor{Type: "system", RequestID: requestID}, nil); err != nil {
+		return Finalized{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Finalized{}, fmt.Errorf("commit: %w", err)
@@ -80,9 +183,7 @@ func recordUnknown(ctx context.Context, pool *pgxpool.Pool, held Held, requestID
 }
 
 // finalizeDeclined handles a hard provider decline: fail the booking, release
-// the held tickets, record the failed payment. If the guarded UPDATE loses to
-// the expiry worker, the booking is already failed and tickets already
-// released — we only record the payment for the audit trail.
+// the held tickets, record the failed payment.
 func finalizeDeclined(ctx context.Context, pool *pgxpool.Pool, held Held, r ChargeResult, userID, requestID string) (Finalized, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -90,37 +191,19 @@ func finalizeDeclined(ctx context.Context, pool *pgxpool.Pool, held Held, r Char
 	}
 	defer tx.Rollback(ctx)
 
-	tag, err := tx.Exec(ctx,
-		`UPDATE booking SET status = 'failed', failed_at = NOW(), version = version + 1
-		 WHERE id = $1 AND status = 'held'`, held.BookingID)
+	released, applied, err := FailBooking(ctx, tx, held, "card_declined", &r,
+		Actor{Type: "user", UserID: userID, RequestID: requestID})
 	if err != nil {
-		return Finalized{}, fmt.Errorf("fail booking: %w", err)
+		return Finalized{}, err
 	}
-
-	released := 0
-	if tag.RowsAffected() == 1 {
-		// We won: release the still-held tickets back to available.
-		rt, err := tx.Exec(ctx,
-			`UPDATE tickets SET status = 'available', booking_id = NULL
-			 WHERE booking_id = $1 AND status = 'held'`, held.BookingID)
-		if err != nil {
-			return Finalized{}, fmt.Errorf("release tickets: %w", err)
-		}
-		released = int(rt.RowsAffected())
-		if err := auditPair(ctx, tx, held.BookingID, userID, requestID,
-			"booking_failed", "payment_declined"); err != nil {
+	if !applied {
+		// The expiry worker already failed + released + compensated Redis.
+		// Record the decline for the trail only — no ticket or Redis action.
+		if err := insertFailedPayment(ctx, tx, held, r); err != nil {
 			return Finalized{}, err
 		}
 	}
-	// else: expiry worker already failed + released + compensated Redis;
-	// record the decline for the trail only, no ticket/Redis action.
 
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO payments (booking_id, provider, provider_txn_id, status, amount_cents, currency, provider_response)
-		 VALUES ($1, 'simulated', $2, 'failed', $3, $4, $5::jsonb)`,
-		held.BookingID, nullStr(r.TxnID), held.TotalCents, held.Currency, providerResp(r.Raw)); err != nil {
-		return Finalized{}, fmt.Errorf("insert failed payment: %w", err)
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return Finalized{}, fmt.Errorf("commit: %w", err)
 	}
@@ -139,26 +222,22 @@ func finalizeConfirmed(ctx context.Context, pool *pgxpool.Pool, held Held, r Cha
 	}
 	defer tx.Rollback(ctx)
 
-	tag, err := tx.Exec(ctx,
-		`UPDATE booking SET status = 'confirmed', confirmed_at = NOW(), version = version + 1
-		 WHERE id = $1 AND status = 'held'`, held.BookingID)
+	tickets, applied, err := ConfirmBooking(ctx, tx, held, r,
+		Actor{Type: "user", UserID: userID, RequestID: requestID})
 	if err != nil {
-		return Finalized{}, fmt.Errorf("confirm booking: %w", err)
+		return Finalized{}, err
 	}
 
-	if tag.RowsAffected() == 0 {
+	if !applied {
 		// The expiry worker won and released the tickets, but the charge
 		// succeeded. hold_expires_at is 10min precisely to make this rare.
 		if err := insertSucceededPayment(ctx, tx, held, r); err != nil {
 			return Finalized{}, err
 		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, metadata, request_id)
-			 VALUES ('booking', $1, 'reconciliation_needed', 'system', $2, $3)`,
-			held.BookingID,
-			map[string]any{"reason": "charge_succeeded_after_hold_expired", "provider_txn_id": r.TxnID},
-			requestID); err != nil {
-			return Finalized{}, fmt.Errorf("audit reconciliation_needed: %w", err)
+		if err := audit(ctx, tx, held.BookingID, "reconciliation_needed",
+			Actor{Type: "system", RequestID: requestID},
+			map[string]any{"reason": "charge_succeeded_after_hold_expired", "provider_txn_id": r.TxnID}); err != nil {
+			return Finalized{}, err
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return Finalized{}, fmt.Errorf("commit: %w", err)
@@ -166,37 +245,10 @@ func finalizeConfirmed(ctx context.Context, pool *pgxpool.Pool, held Held, r Cha
 		return Finalized{Status: "expired_after_charge"}, nil
 	}
 
-	rows, err := tx.Query(ctx,
-		`UPDATE tickets SET status = 'sold'
-		 WHERE booking_id = $1 AND status = 'held' RETURNING id`, held.BookingID)
-	if err != nil {
-		return Finalized{}, fmt.Errorf("sell tickets: %w", err)
-	}
-	var ticketIDs []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return Finalized{}, fmt.Errorf("scan sold ticket: %w", err)
-		}
-		ticketIDs = append(ticketIDs, id)
-	}
-	rows.Close()
-	if rows.Err() != nil {
-		return Finalized{}, fmt.Errorf("iterate sold tickets: %w", rows.Err())
-	}
-
-	if err := insertSucceededPayment(ctx, tx, held, r); err != nil {
-		return Finalized{}, err
-	}
-	if err := auditPair(ctx, tx, held.BookingID, userID, requestID,
-		"booking_confirmed", "payment_succeeded"); err != nil {
-		return Finalized{}, err
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return Finalized{}, fmt.Errorf("commit: %w", err)
 	}
-	return Finalized{Status: "confirmed", Tickets: ticketIDs}, nil
+	return Finalized{Status: "confirmed", Tickets: tickets}, nil
 }
 
 func insertSucceededPayment(ctx context.Context, tx pgx.Tx, held Held, r ChargeResult) error {
@@ -211,14 +263,22 @@ func insertSucceededPayment(ctx context.Context, tx pgx.Tx, held Held, r ChargeR
 	return nil
 }
 
-func auditPair(ctx context.Context, tx pgx.Tx, bookingID, userID, requestID, a1, a2 string) error {
-	for _, action := range []string{a1, a2} {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, request_id)
-			 VALUES ('booking', $1, $2, 'user', $3, $4)`,
-			bookingID, action, userID, requestID); err != nil {
-			return fmt.Errorf("audit %s: %w", action, err)
-		}
+func insertFailedPayment(ctx context.Context, tx pgx.Tx, held Held, r ChargeResult) error {
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO payments (booking_id, provider, provider_txn_id, status, amount_cents, currency, provider_response)
+		 VALUES ($1, 'simulated', $2, 'failed', $3, $4, $5::jsonb)`,
+		held.BookingID, nullStr(r.TxnID), held.TotalCents, held.Currency, providerResp(r.Raw)); err != nil {
+		return fmt.Errorf("insert failed payment: %w", err)
+	}
+	return nil
+}
+
+func audit(ctx context.Context, tx pgx.Tx, bookingID, action string, a Actor, metadata any) error {
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, metadata, request_id)
+		 VALUES ('booking', $1, $2, $3, $4, $5, $6)`,
+		bookingID, action, a.Type, nullStr(a.UserID), metadata, nullStr(a.RequestID)); err != nil {
+		return fmt.Errorf("audit %s: %w", action, err)
 	}
 	return nil
 }

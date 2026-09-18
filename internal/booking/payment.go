@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -33,8 +34,11 @@ const (
 	// reconciliation. This is the zero value on purpose: any early return
 	// without a definitive provider answer is ambiguous.
 	Ambiguous Outcome = iota
-	Succeeded          // provider confirmed the charge (HTTP 200, status succeeded)
-	Declined           // provider refused the card (HTTP 402, status failed)
+	Succeeded         // provider confirmed the charge (HTTP 200, status succeeded)
+	Declined          // provider refused the card (HTTP 402, status failed)
+	// NotFound: the provider has no charge under this idempotency key, so no
+	// money moved. Only a lookup can produce it — a charge attempt cannot.
+	NotFound
 )
 
 // ChargeResult is everything TX2 needs to finalize, with the outcome already
@@ -76,30 +80,84 @@ func (c *PaymentClient) Charge(ctx context.Context, idemKey string, amountCents 
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	var ch struct {
-		ID          string `json:"id"`
-		Status      string `json:"status"`
-		FailureCode string `json:"failure_code"`
-		Card        struct {
-			Brand string `json:"brand"`
-			Last4 string `json:"last4"`
-		} `json:"card"`
-	}
+	var ch chargeBody
 
 	switch resp.StatusCode {
 	case http.StatusOK:
 		if json.Unmarshal(raw, &ch) != nil || ch.Status != "succeeded" {
 			return ChargeResult{Outcome: Ambiguous, Raw: raw}
 		}
-		return ChargeResult{Outcome: Succeeded, TxnID: ch.ID,
-			CardBrand: ch.Card.Brand, CardLast4: ch.Card.Last4, Raw: raw}
+		return ch.result(Succeeded, raw)
 	case http.StatusPaymentRequired:
 		_ = json.Unmarshal(raw, &ch)
-		return ChargeResult{Outcome: Declined, TxnID: ch.ID, FailureCode: ch.FailureCode, Raw: raw}
+		return ch.result(Declined, raw)
 	default:
 		// 500 and anything else: no idempotency guarantee that a charge
 		// exists. Treat as ambiguous (case D); reconciliation will find the
 		// provider has no record and fail it cleanly.
 		return ChargeResult{Outcome: Ambiguous, Raw: raw}
 	}
+}
+
+// Lookup asks the provider what happened under an idempotency key. This is the
+// reconciliation bridge: after an ambiguous charge, it is the ONLY source of
+// truth about whether money moved. It is side-effect-free, which is why two
+// workers racing on the same booking is harmless.
+//
+// Outcomes: Succeeded / Declined (the provider has a record), NotFound (it has
+// none — no money moved, safe to fail the booking), Ambiguous (we could not ask
+// — never guess, retry next cycle).
+func (c *PaymentClient) Lookup(ctx context.Context, idemKey string) ChargeResult {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.BaseURL+"/v1/charges/by-idempotency-key/"+url.PathEscape(idemKey), nil)
+	if err != nil {
+		return ChargeResult{Outcome: Ambiguous}
+	}
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return ChargeResult{Outcome: Ambiguous}
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var ch chargeBody
+		if json.Unmarshal(raw, &ch) != nil {
+			return ChargeResult{Outcome: Ambiguous, Raw: raw}
+		}
+		switch ch.Status {
+		case "succeeded":
+			return ch.result(Succeeded, raw)
+		case "failed":
+			return ch.result(Declined, raw)
+		default:
+			// A status we don't understand is not a licence to guess.
+			return ChargeResult{Outcome: Ambiguous, Raw: raw}
+		}
+	case http.StatusNotFound:
+		return ChargeResult{Outcome: NotFound, Raw: raw}
+	default:
+		// 401/5xx: we did not learn anything. Defer.
+		return ChargeResult{Outcome: Ambiguous, Raw: raw}
+	}
+}
+
+// chargeBody is the provider's charge representation, shared by POST /charges
+// and the by-key lookup (same JSON shape on both endpoints).
+type chargeBody struct {
+	ID          string `json:"id"`
+	Status      string `json:"status"`
+	FailureCode string `json:"failure_code"`
+	Card        struct {
+		Brand string `json:"brand"`
+		Last4 string `json:"last4"`
+	} `json:"card"`
+}
+
+func (ch chargeBody) result(o Outcome, raw []byte) ChargeResult {
+	return ChargeResult{Outcome: o, TxnID: ch.ID, FailureCode: ch.FailureCode,
+		CardBrand: ch.Card.Brand, CardLast4: ch.Card.Last4, Raw: raw}
 }

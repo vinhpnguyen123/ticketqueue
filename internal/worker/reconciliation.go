@@ -1,0 +1,150 @@
+package worker
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
+)
+
+// ReconcileInterval is how often stuck holds are resolved against the provider.
+const ReconcileInterval = 30 * time.Second
+
+// ReconcileBatch caps one cycle so a backlog can't produce an unbounded run of
+// provider calls.
+const ReconcileBatch = 50
+
+type candidate struct {
+	id         string
+	idemKey    string
+	tierID     string
+	totalCents int64
+	currency   string
+}
+
+// ReconcileCycle resolves bookings left 'held' by an ambiguous payment outcome:
+// it asks the provider what really happened, by the booking's idempotency key,
+// and confirms or fails accordingly. When the provider can't be reached it does
+// nothing — never guess (§3, the money rule).
+//
+// The cycle is deliberately three separate steps: a PLAIN READ to find work,
+// the provider call with NO transaction open, then a fresh short transaction to
+// finalize. Holding a row lock across the network call would violate
+// Principle #2. Safety comes instead from the guarded UPDATEs inside
+// ConfirmBooking/FailBooking plus the provider's own idempotency: if two
+// instances reconcile the same booking, the loser gets applied=false and skips,
+// and the duplicated lookup is side-effect-free.
+func ReconcileCycle(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, pc *booking.PaymentClient) error {
+	// 90s is comfortably past the 3s payment timeout, so the synchronous
+	// purchase path has definitely finished with this booking. Distinct from
+	// hold_expires_at (10 min), which is the give-up deadline.
+	rows, err := pool.Query(ctx,
+		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency
+		 FROM booking
+		 WHERE status = 'held' AND created_at < NOW() - INTERVAL '90 seconds'
+		 ORDER BY created_at
+		 LIMIT $1`, ReconcileBatch)
+	if err != nil {
+		return fmt.Errorf("select stuck holds: %w", err)
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.idemKey, &c.tierID, &c.totalCents, &c.currency); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan candidate: %w", err)
+		}
+		candidates = append(candidates, c)
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		return fmt.Errorf("iterate candidates: %w", rows.Err())
+	}
+
+	// One bad booking must never abort the batch: count and carry on.
+	failures := 0
+	for _, c := range candidates {
+		if err := reconcileOne(ctx, rdb, pool, pc, c); err != nil {
+			failures++
+			slog.Error("reconcile booking failed", "booking_id", c.id, "error", err)
+		}
+	}
+	if failures > 0 {
+		return fmt.Errorf("reconcile: %d of %d bookings failed", failures, len(candidates))
+	}
+	return nil
+}
+
+func reconcileOne(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, pc *booking.PaymentClient, c candidate) error {
+	// NO transaction is open here. This is the network call.
+	res := pc.Lookup(ctx, c.idemKey)
+
+	held := booking.Held{BookingID: c.id, TotalCents: c.totalCents, Currency: c.currency}
+	actor := booking.Actor{Type: "worker"}
+	released := 0
+
+	switch res.Outcome {
+	case booking.Ambiguous:
+		// We could not ask. Leave it held and try again next cycle. No audit
+		// row: a deferral is not a state change, and a long provider outage
+		// would write one row per booking per cycle for zero information.
+		slog.Warn("reconcile deferred: provider did not answer", "booking_id", c.id)
+		return nil
+
+	case booking.Succeeded:
+		return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+			// Tickets are still held by THIS booking, so confirming is safe;
+			// Redis is not touched — the decrement from TX1 still stands.
+			_, applied, err := booking.ConfirmBooking(ctx, tx, held, res, actor)
+			if err == nil && !applied {
+				slog.Debug("reconcile skipped: booking no longer held", "booking_id", c.id)
+			}
+			return err
+		})
+
+	case booking.Declined:
+		if err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+			qty, applied, err := booking.FailBooking(ctx, tx, held, "card_declined", &res, actor)
+			if err == nil && !applied {
+				slog.Debug("reconcile skipped: booking no longer held", "booking_id", c.id)
+			}
+			released = qty
+			return err
+		}); err != nil {
+			return err
+		}
+
+	case booking.NotFound:
+		// The provider has no record under this key: no money moved. Failing
+		// is safe, and no payments row is written — there was no attempt.
+		if err := pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+			qty, applied, err := booking.FailBooking(ctx, tx, held, "no_charge_found", nil, actor)
+			if err == nil && !applied {
+				slog.Debug("reconcile skipped: booking no longer held", "booking_id", c.id)
+			}
+			released = qty
+			return err
+		}); err != nil {
+			return err
+		}
+
+	default:
+		return fmt.Errorf("unknown lookup outcome %d", res.Outcome)
+	}
+
+	// Redis compensation AFTER commit, never inside the transaction. Lost to a
+	// crash here → the drift checker heals it; accepted window.
+	if released > 0 {
+		if err := booking.CompensateInventory(ctx, rdb, c.tierID, released); err != nil {
+			slog.Error("reconcile inventory compensation failed (drift checker will heal)",
+				"tier_id", c.tierID, "qty", released, "error", err)
+		}
+	}
+	return nil
+}
