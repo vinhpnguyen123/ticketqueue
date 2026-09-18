@@ -57,3 +57,16 @@ func Middleware(secret string) func(http.Handler) http.Handler {
 		})
 	}
 }
+
+// RequireAdmin rejects any request whose token does not carry is_admin.
+// It must be mounted INSIDE Middleware, which is what puts the flag in the
+// context; a missing flag means no token was validated, so it fails closed.
+func RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isAdmin, ok := IsAdminFromContext(r.Context()); !ok || !isAdmin {
+			response.Error(w, r, http.StatusForbidden, "forbidden", "admin access required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

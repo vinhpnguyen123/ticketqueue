@@ -62,8 +62,9 @@ func main() {
 	api.NewAuthHandler(pool, rdb, cfg.JWTSecret).Mount(r)
 	api.NewEventsHandler(pool).Mount(r)
 	api.NewQueueHandler(pool, rdb, cfg.JWTSecret).Mount(r)
-	api.NewPurchaseHandler(pool, rdb, cfg.JWTSecret,
-		booking.NewPaymentClient(cfg.PaymentURL, cfg.PaymentKey)).Mount(r)
+	payments := booking.NewPaymentClient(cfg.PaymentURL, cfg.PaymentKey)
+	api.NewPurchaseHandler(pool, rdb, cfg.JWTSecret, payments).Mount(r)
+	api.NewAdminHandler(pool, rdb, cfg.JWTSecret, payments).Mount(r)
 
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 
