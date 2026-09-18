@@ -52,13 +52,25 @@ export function errorType(res) {
   }
 }
 
+// Every outcome recordPurchase can return. 'conflict' (409 that is not
+// sold_out, e.g. request_in_progress) and 'validation_failed' (422, e.g.
+// idempotency_key_reuse) belong here because the API really does define them —
+// leaving them out made a harness bug report as an undefined outcome while
+// purchase_outcomes{outcome:unexpected} sat at zero, which is a contradiction
+// that costs an hour to read. They are not acceptable in a clean run, so the
+// scripts thresholds them to count==0 instead; that says 'the test is wrong',
+// where this check says 'the system did something it has no name for'.
+const DEFINED = [
+  'confirmed', 'sold_out', 'ambiguous', 'declined',
+  'window_expired', 'duplicate_blocked', 'conflict', 'validation_failed',
+];
+
 // checkPurchase asserts the response is one of the outcomes this system is
 // allowed to produce. A 5xx fails the check; an expected rejection does not.
 export function checkPurchase(res, outcome) {
   return check(res, {
     'purchase answered without a server error': (r) => r.status < 500,
-    'purchase outcome is one the system defines': () =>
-      ['confirmed', 'sold_out', 'ambiguous', 'declined', 'window_expired', 'duplicate_blocked'].includes(outcome),
+    'purchase outcome is one the system defines': () => DEFINED.includes(outcome),
   });
 }
 

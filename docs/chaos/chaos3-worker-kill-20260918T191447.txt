@@ -1,0 +1,68 @@
+[1mchaos3-worker-kill[0m  2026-09-18T23:14:47Z
+  [2mVUs=500  output=/Users/vinhnguyen/ticketqueue/docs/chaos/chaos3-worker-kill-20260918T191447.txt[0m
+  [2mbuilding into /var/folders/rv/vqlccvrx6mj_rtbdjc5v1b2r0000gn/T//ticketqueue-chaos-13266[0m
+
+[1m▸ Start the world[0m
+  [2mpayments started (pid 13680)[0m
+  [2mworker started (pid 13681)[0m
+  [2mseeding: 40000 tickets, 500 users[0m
+  [2mtier b0f60acb-b672-4244-a926-6a4ea543e330[0m
+  [2mapi started (pid 13728)[0m
+
+[1m▸ Load: 500 VUs, 120s, 10% paying with tok_drops_response[0m
+  [2mthe dropped-response token is what produces ambiguous bookings continuously[0m
+
+[1m▸ KILL the worker for 60s[0m
+  [2mworker KILLED (pid 13681)[0m
+  [2mheld at the moment of the kill: 206[0m
+  [2mt+36 s  held=137    confirmed=5924  [0m
+  [2mt+49 s  held=320    confirmed=7630  [0m
+  [2mt+63 s  held=347    confirmed=8855  [0m
+  [2mt+78 s  held=90     confirmed=10315 [0m
+  [2mt+92 s  held=285    confirmed=11288 [0m
+
+[1m▸ Assertions DURING the worker outage[0m
+  [32mPASS[0m  the API kept completing purchases at every sample, with no worker alive (1)
+  [32mPASS[0m  purchases still completed — the happy path needs no worker (11707 >= 207)
+  [32mPASS[0m  unresolved bookings accumulated while nothing could resolve them (347 >= 206)
+  [2mreadiness probe timed out 1 time(s) — a saturation signal, not an outage[0m
+  [32mPASS[0m  every held booking still owns its tickets — nothing was lost (0)
+
+[1m▸ Restart the worker[0m
+  [2mworker started (pid 15573)[0m
+
+[1m▸ Drain[0m
+  [2mbacklog of 80 held bookings (peak during the outage: 347)[0m
+  [2mStuckAfter=90s, then ReconcileBatch=50 per 30s cycle[0m
+  [32mPASS[0m  backlog of 80 drained 93s after the worker came back
+
+[1m▸ Assertions AFTER restart[0m
+  [32mPASS[0m  the backlog drained completely (0)
+  [32mPASS[0m  zero bookings held longer than 5 minutes (0)
+
+[1m▸ Money correctness (scripts/verify_run.sql)[0m
+  [32mPASS[0m  all nine checks green
+     PASS   |                  0
+     PASS   |              0
+     PASS   |        70847 |         70847
+     PASS   |            0
+     PASS   |                0
+     PASS   |   3542350000 |    3542350000
+     PASS   |         0
+     PASS   |           0
+     PASS   |           0
+     PASS   |              0
+
+[1m▸ RESULT[0m
+  [1mWorker dead 60s under load: unresolved bookings peaked at 347, the API never stopped completing purchases, the 80 left over drained 93s after restart, zero money discrepancies.[0m
+  [2mk6 detail: /Users/vinhnguyen/ticketqueue/docs/chaos/chaos3-worker-kill-20260918T191447-k6.txt[0m
+
+[1m▸ Grafana, this run's window[0m
+  http://localhost:3000/d/ticketqueue/ticketqueue?from=1789773257000&to=1789773530000
+  [2mThe worker is a recovery mechanism, not a correctness dependency: the data was durable without it.[0m
+
+[1m▸ VERDICT[0m
+  [32m[1mchaos3-worker-kill PASSED[0m — /Users/vinhnguyen/ticketqueue/docs/chaos/chaos3-worker-kill-20260918T191447.txt
+scripts/chaos/lib.sh: line 112: 13680 Killed: 9               PAYMENT_PORT="$PAYMENT_PORT" nohup "$BUILD_DIR/payment-service" > "$BUILD_DIR/payments.log" 2>&1
+scripts/chaos/lib.sh: line 112: 13728 Killed: 9               PORT="$API_PORT" PAYMENT_URL="$PAYMENT_URL" nohup "$BUILD_DIR/api" > "$BUILD_DIR/api.log" 2>&1
+scripts/chaos/lib.sh: line 112: 15573 Killed: 9               PAYMENT_URL="$PAYMENT_URL" METRICS_PORT="$WORKER_METRICS_PORT" nohup "$BUILD_DIR/worker" > "$BUILD_DIR/worker.log" 2>&1

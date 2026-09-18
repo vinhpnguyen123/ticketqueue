@@ -7,7 +7,7 @@ PORT ?= 8081
 PAYMENT_PORT ?= 8082
 PAYMENT_URL ?= http://localhost:8082
 
-.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo load-seed load-storm load-journey load-calibrate verify-run sabotage
+.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo load-seed load-storm load-journey load-calibrate verify-run sabotage chaos-1 chaos-2 chaos-3 chaos-all
 
 up:
 	docker compose up -d
@@ -89,3 +89,17 @@ verify-run:
 # Proves the verification suite can actually fail. See scripts/k6/README.md.
 sabotage:
 	docker compose exec -T postgres psql -U ticketqueue -d ticketqueue -f - < scripts/sabotage.sql
+
+# ---- Chaos ------------------------------------------------------------------
+# Each scenario starts and kills the binaries itself, so stop any `make run` /
+# `make run-worker` / `make run-payments` first. Results land in docs/chaos/.
+chaos-1:
+	bash scripts/chaos/chaos1_api_kill.sh
+
+chaos-2:
+	bash scripts/chaos/chaos2_provider_outage.sh
+
+chaos-3:
+	bash scripts/chaos/chaos3_worker_kill.sh
+
+chaos-all: chaos-1 chaos-2 chaos-3

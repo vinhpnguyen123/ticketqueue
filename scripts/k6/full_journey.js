@@ -15,7 +15,7 @@
 import http from 'k6/http';
 import { sleep } from 'k6';
 import { Trend } from 'k6/metrics';
-import { world, userFor, API, idemKey, purchaseBody } from './lib/setup.js';
+import { world, userFor, API, idemKey, purchaseBody, sustained } from './lib/setup.js';
 
 // 409 sold_out and 504 payment_processing_unclear are outcomes this system is
 // DESIGNED to produce, so k6's default (any 4xx/5xx is a failure) would report
@@ -39,12 +39,10 @@ const MAX_WAIT_SECONDS = 120;
 
 export const options = {
   scenarios: {
-    journey: {
-      executor: 'per-vu-iterations',
-      vus: VUS,
-      iterations: 1,
-      maxDuration: DURATION,
-    },
+    // DURATION switches this from one journey per VU to sustained load. CHAOS 1
+    // needs the sustained form: a scenario that kills the API at t=30s proves
+    // nothing if every VU already finished by t=20s.
+    journey: sustained(VUS, DURATION),
   },
   thresholds: {
     'purchase_completed_duration': ['p(95)<2000'],
@@ -52,6 +50,11 @@ export const options = {
     // Meaningful only because of setResponseCallback above: 5xx only.
     'http_req_failed': ['rate==0'],
     'purchase_outcomes{outcome:server_error}': ['count==0'],
+    // Not app failures — harness failures. A 422 here is a reused idempotency
+    // key, a 'conflict' is a duplicate key still in flight. Either means the
+    // run is measuring the idempotency middleware, so the numbers are void.
+    'purchase_outcomes{outcome:validation_failed}': ['count==0'],
+    'purchase_outcomes{outcome:conflict}': ['count==0'],
   },
 };
 

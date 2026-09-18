@@ -218,3 +218,61 @@ func TestDropsResponse(t *testing.T) {
 		t.Fatalf("post-drop lookup = %d %v, want 200 succeeded", lresp.StatusCode, body["status"])
 	}
 }
+
+// TestChaosSwitchBlackholesThenRecovers is the check that the §10 switch
+// produces an UNREACHABLE provider and not merely a failing one. The
+// distinction is the whole point: an error status is an answer, and an answer
+// would let hold-expiry conclude something. Silence must make the client's own
+// timeout fire instead.
+func TestChaosSwitchBlackholesThenRecovers(t *testing.T) {
+	ts := newTestServer(t)
+
+	setChaos := func(seconds int) {
+		body := strings.NewReader(fmt.Sprintf(`{"seconds":%d}`, seconds))
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/chaos/unreachable", body)
+		req.Header.Set("Authorization", "Bearer "+testKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("set chaos: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("set chaos: want 200, got %d", resp.StatusCode)
+		}
+	}
+
+	// A healthy provider first, so a later failure cannot be blamed on setup.
+	if resp, _ := postCharge(t, ts, "chaos-before", "tok_visa"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("baseline charge: want 200, got %d", resp.StatusCode)
+	}
+
+	setChaos(60)
+
+	// A client with a deadline, exactly like booking.PaymentClient's 3s one.
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/charges",
+		bytes.NewReader([]byte(`{"amount":1000,"currency":"USD","payment_token":"tok_visa"}`)))
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	req.Header.Set("Idempotency-Key", "chaos-during")
+	if resp, err := client.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatalf("during outage: want a client timeout, got HTTP %d — an answered "+
+			"request means the provider was reachable, which is not this scenario", resp.StatusCode)
+	}
+
+	// The charge must not have reached the ledger: a black-holed request is one
+	// the provider never saw, so reconciliation must find nothing under the key.
+	// The pause is the point of the assertion — it gives the hanging handler
+	// every chance to wake up and charge late, which is the bug this guards.
+	setChaos(0)
+	time.Sleep(400 * time.Millisecond)
+	resp, body := lookupByKey(t, ts, "chaos-during")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("after outage: want 404 for a black-holed key, got %d (%v)", resp.StatusCode, body)
+	}
+
+	// And the provider is serving again immediately, not after its own timer.
+	if resp, _ := postCharge(t, ts, "chaos-after", "tok_visa"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("after outage: want 200, got %d", resp.StatusCode)
+	}
+}

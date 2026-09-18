@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -57,6 +58,15 @@ type server struct {
 	apiKey string
 	st     *store
 
+	// chaosUntil is a unix-nano deadline before which /v1 answers nothing.
+	// This is the §10 chaos switch, and it exists because the money rule
+	// cannot be tested by restarting this process: the ledger is in memory, so
+	// a restart makes the provider FORGET a charge rather than fail to answer
+	// it. Those are different failures and only the second one is "the
+	// provider is unreachable". Conflating them would have hold-expiry release
+	// tickets for a charge that really happened — the exact bug §17 fixed.
+	chaosUntil atomic.Int64
+
 	// Webhook delivery, configured via WithWebhook. Empty URL disables it.
 	webhookURL    string
 	webhookSecret string
@@ -77,8 +87,12 @@ func NewServer(apiKey string, opts ...Option) http.Handler {
 	})
 	// VPC-only in a real deploy: never expose /metrics publicly.
 	r.Handle("/metrics", metrics.Handler())
+	// Outside /v1 on purpose: the switch must stay reachable while /v1 is
+	// black-holed, or an outage could never be called off.
+	r.With(s.requireAuth).Post("/chaos/unreachable", s.setChaos)
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(s.requireAuth)
+		r.Use(s.chaosBlackhole)
 		r.Post("/charges", s.createCharge)
 		// The reconciliation bridge: after a dropped response, ticketqueue
 		// looks the charge up by the idempotency key it sent, to learn
@@ -254,4 +268,67 @@ func randHex(n int) string {
 		panic(err) // crypto/rand failing means the host is broken
 	}
 	return hex.EncodeToString(b)
+}
+
+// ------------------------------------------------------------ §10 chaos switch
+
+// setChaos makes every /v1 route stop answering for N seconds. seconds=0 ends
+// the outage immediately, which is how a scenario brings the provider back
+// without waiting out its own timer.
+func (s *server) setChaos(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Seconds int `json:"seconds"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Seconds < 0 {
+		writeErr(w, http.StatusUnprocessableEntity, "validation_failed", "seconds must be a non-negative integer")
+		return
+	}
+	until := time.Now().Add(time.Duration(req.Seconds) * time.Second)
+	s.chaosUntil.Store(until.UnixNano())
+	slog.Warn("CHAOS: provider unreachable", "seconds", req.Seconds, "until", until.UTC())
+	writeJSON(w, http.StatusOK, map[string]any{
+		"unreachable_until": until.UTC().Format(time.RFC3339),
+		"seconds":           req.Seconds,
+	})
+}
+
+// chaosBlackhole hangs instead of answering. It deliberately does NOT return an
+// error status: a 5xx is a provider that IS reachable and said something, and
+// the client would classify it the same way but for the wrong reason. Silence
+// is what makes the 3s client timeout fire, which is the path under test.
+//
+// A request that arrives during an outage is NEVER handled, even if the outage
+// lifts while it is still hanging. Handing it to the ledger late would turn
+// "the provider never saw this" into "the provider charged it a minute later",
+// which is a different scenario (tok_drops_response owns that one) and would
+// make a chaos run non-deterministic: whether money moved would depend on how
+// the outage timer lined up with an in-flight request. The wait exists only so
+// the caller's own deadline is what ends the request.
+func (s *server) chaosBlackhole(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if time.Now().UnixNano() >= s.chaosUntil.Load() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		for {
+			d := time.Until(time.Unix(0, s.chaosUntil.Load()))
+			if d <= 0 {
+				// Outage over, but this request was black-holed. Drop it: the
+				// empty body reads as ambiguous, never as a success.
+				return
+			}
+			// Re-check on a short tick so seconds=0 ends the outage at once
+			// rather than after the original deadline.
+			if d > 250*time.Millisecond {
+				d = 250 * time.Millisecond
+			}
+			t := time.NewTimer(d)
+			select {
+			case <-r.Context().Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+		}
+	})
 }

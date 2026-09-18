@@ -15,7 +15,7 @@
 //   k6 run -e VUS=2000 scripts/k6/purchase_storm.js
 //   make verify-run
 import http from 'k6/http';
-import { world, userFor, API, idemKey, purchaseBody } from './lib/setup.js';
+import { world, userFor, API, idemKey, purchaseBody, sustained } from './lib/setup.js';
 
 // 409 sold_out and 504 payment_processing_unclear are outcomes this system is
 // DESIGNED to produce, so k6's default (any 4xx/5xx is a failure) would report
@@ -30,15 +30,12 @@ const QUANTITY = parseInt(__ENV.QUANTITY || '1', 10);
 
 export const options = {
   scenarios: {
-    storm: {
-      // One shot each, all at once: this measures contention, not throughput
-      // over time. A ramp would let the tier sell out before the later VUs
-      // arrive, and they would measure an empty tier instead of a race.
-      executor: 'per-vu-iterations',
-      vus: VUS,
-      iterations: 1,
-      maxDuration: '2m',
-    },
+    // One shot each, all at once: this measures contention, not throughput
+    // over time. A ramp would let the tier sell out before the later VUs
+    // arrive, and they would measure an empty tier instead of a race.
+    // Setting DURATION switches to sustained load, which is what the chaos
+    // scenarios need and what nothing else should use.
+    storm: sustained(VUS, '2m'),
   },
   thresholds: {
     // THE latency number: completed purchases only. See lib/checks.js for why
@@ -51,6 +48,11 @@ export const options = {
     'http_req_failed': ['rate==0'],
     'purchase_outcomes{outcome:server_error}': ['count==0'],
     'purchase_outcomes{outcome:unexpected}': ['count==0'],
+    // Not app failures — harness failures. A 422 here is a reused idempotency
+    // key, a 'conflict' is a duplicate key still in flight. Either means the
+    // run is measuring the idempotency middleware, so the numbers are void.
+    'purchase_outcomes{outcome:validation_failed}': ['count==0'],
+    'purchase_outcomes{outcome:conflict}': ['count==0'],
   },
 };
 

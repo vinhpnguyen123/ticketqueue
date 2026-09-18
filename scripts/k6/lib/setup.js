@@ -54,10 +54,19 @@ export function userFor(vuID) {
 
 export const API = __ENV.API_URL || 'http://localhost:8081';
 
+// RUN_ID defaults to a per-run value, NOT a constant. Idempotency keys are
+// PRIMARY KEY (key, user_id), so a constant here is only safe while every run
+// re-seeds fresh users. The moment a run reuses the seed — which is every
+// chaos rerun and every quick repeat — a constant makes each iteration collide
+// with the previous run's key and answer 422 idempotency_key_reuse. The test
+// then measures the idempotency middleware instead of the purchase path, and
+// the count of failures is fixed by history rather than by this run.
+const RUN_ID = __ENV.RUN_ID || `${Date.now()}`;
+
 // Each request needs its own idempotency key: reusing one would exercise the
 // replay path rather than the purchase path.
 export function idemKey(prefix, vuID, iter) {
-  return `${prefix}-${__ENV.RUN_ID || 'local'}-${vuID}-${iter}`;
+  return `${prefix}-${RUN_ID}-${vuID}-${iter}`;
 }
 
 export function purchaseBody(seedWorld, purchaseToken, quantity) {
@@ -65,7 +74,33 @@ export function purchaseBody(seedWorld, purchaseToken, quantity) {
     event_id: seedWorld.event_id,
     tier_id: seedWorld.tier_id,
     quantity: quantity,
-    payment_token: __ENV.PAYMENT_TOKEN || 'tok_visa',
+    payment_token: paymentToken(),
     purchase_token: purchaseToken,
   });
+}
+
+// paymentToken picks this VU's card. DROP_PCT mixes in tok_drops_response,
+// which CHAOS 3 needs: killing the worker only proves something if ambiguous
+// bookings are being produced the whole time it is dead. The split is by VU id
+// rather than per iteration so a VU's outcome is reproducible from its number.
+function paymentToken() {
+  const dropPct = parseInt(__ENV.DROP_PCT || '0', 10);
+  if (dropPct > 0 && __VU % 100 < dropPct) {
+    return 'tok_drops_response';
+  }
+  return __ENV.PAYMENT_TOKEN || 'tok_visa';
+}
+
+// sustained picks the executor. The oversell proof wants every VU to fire once
+// at the same instant — a ramp would let the tier sell out before the late VUs
+// arrive. Chaos wants the opposite: load still flowing 30s in, when a process
+// gets killed, and still flowing while it comes back. DURATION picks which.
+//
+// Sustained runs need a tier big enough not to sell out, or every iteration
+// after the first few measures a fast-path rejection instead of a purchase.
+export function sustained(vus, oneShotMaxDuration) {
+  if (__ENV.DURATION) {
+    return { executor: 'constant-vus', vus: vus, duration: __ENV.DURATION };
+  }
+  return { executor: 'per-vu-iterations', vus: vus, iterations: 1, maxDuration: oneShotMaxDuration };
 }
