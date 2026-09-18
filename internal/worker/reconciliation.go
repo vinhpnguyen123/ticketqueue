@@ -40,15 +40,14 @@ type candidate struct {
 // instances reconcile the same booking, the loser gets applied=false and skips,
 // and the duplicated lookup is side-effect-free.
 func ReconcileCycle(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, pc *booking.PaymentClient) error {
-	// 90s is comfortably past the 3s payment timeout, so the synchronous
-	// purchase path has definitely finished with this booking. Distinct from
-	// hold_expires_at (10 min), which is the give-up deadline.
+	// The threshold lives in booking.StuckAfter, shared with the
+	// sync-reconcile-on-retry path, so the two can never disagree.
 	rows, err := pool.Query(ctx,
 		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency
 		 FROM booking
-		 WHERE status = 'held' AND created_at < NOW() - INTERVAL '90 seconds'
+		 WHERE status = 'held' AND created_at < NOW() - make_interval(secs => $1)
 		 ORDER BY created_at
-		 LIMIT $1`, ReconcileBatch)
+		 LIMIT $2`, booking.StuckAfter.Seconds(), ReconcileBatch)
 	if err != nil {
 		return fmt.Errorf("select stuck holds: %w", err)
 	}

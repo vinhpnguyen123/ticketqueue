@@ -3,11 +3,20 @@ package booking
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
+
+// StuckAfter is how old a 'held' booking must be before anything treats it as
+// stuck and asks the provider about it. It is comfortably past the 3s payment
+// timeout, so the synchronous purchase path has definitely finished with the
+// booking. Distinct from hold_expires_at (10 minutes), which is the give-up
+// deadline. Every caller reads it from here — the reconciliation worker's scan
+// and the sync-reconcile-on-retry path — so the threshold lives in one place.
+const StuckAfter = 90 * time.Second
 
 // Provider results, as reported to callers and to the admin API.
 const (
