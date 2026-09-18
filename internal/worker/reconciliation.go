@@ -10,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // ReconcileInterval is how often stuck holds are resolved against the provider.
@@ -64,6 +65,8 @@ func ReconcileCycle(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, 
 	if rows.Err() != nil {
 		return fmt.Errorf("iterate candidates: %w", rows.Err())
 	}
+
+	metrics.WorkerItems.WithLabelValues(metrics.WorkerReconciliation).Add(float64(len(candidates)))
 
 	// One bad booking must never abort the batch: count and carry on.
 	failures := 0

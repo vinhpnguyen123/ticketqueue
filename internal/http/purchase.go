@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -18,6 +19,7 @@ import (
 	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
 	"github.com/vinhpnguyen123/ticketqueue/internal/http/response"
 	"github.com/vinhpnguyen123/ticketqueue/internal/idempotency"
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // PurchaseHandler serves POST /v1/purchases (TX1 + the Week-4 payment seam).
@@ -92,6 +94,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// this event and their window is still open.
 	claims, err := auth.ParsePurchaseToken(req.PurchaseToken, h.secret)
 	if errors.Is(err, auth.ErrTokenExpired) {
+		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeWindowExpired).Inc()
 		response.Error(w, r, http.StatusGone, "purchase_window_expired", "your purchase window has closed")
 		return
 	}
@@ -106,6 +109,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to process purchase")
 		return
 	} else if found {
+		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeDuplicateBlocked).Inc()
 		response.ErrorWithDetails(w, r, http.StatusGone, "active_booking_exists",
 			"you already have a booking in progress",
 			map[string]any{"booking_id": existing})
@@ -131,6 +135,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// Layer 1: Redis fast reject.
 	if err := booking.ReserveInventory(r.Context(), h.rdb, h.pool, tier.ID, req.Quantity); errors.Is(err, booking.ErrSoldOut) {
+		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeSoldOut).Inc()
 		response.Error(w, r, http.StatusConflict, "sold_out", "not enough tickets available")
 		return
 	} else if err != nil {
@@ -141,8 +146,12 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	// TX1: Layers 2 and 3.
 	idemKey := r.Header.Get("Idempotency-Key")
+	// Timings wrap the call and are recorded after it returns, so no
+	// instrumentation ever runs while a row lock is held (§11a).
+	tx1Start := time.Now()
 	held, err := booking.HoldTickets(r.Context(), h.pool, userID, tier, req.Quantity,
 		idemKey, middleware.GetReqID(r.Context()))
+	metrics.PurchasePhase.WithLabelValues(metrics.PhaseTX1).Observe(time.Since(tx1Start).Seconds())
 	if err != nil {
 		// TX1 rolled back but Layer 1 already decremented: give it back.
 		// After commit/rollback only, never inside the transaction.
@@ -151,6 +160,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 				"tier_id", tier.ID, "qty", req.Quantity, "error", cerr)
 		}
 		if errors.Is(err, booking.ErrSoldOut) {
+			metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeSoldOut).Inc()
 			response.Error(w, r, http.StatusConflict, "sold_out", "not enough tickets available")
 			return
 		}
@@ -164,11 +174,15 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// --- PHASE 2: the payment call. NO DB transaction is open here — we never
 	// hold locks across a network call. Charge classifies every outcome
 	// (succeeded / declined / ambiguous) so PHASE 3 branches in one place.
+	payStart := time.Now()
 	charge := h.payments.Charge(r.Context(), idemKey, held.TotalCents, held.Currency, req.PaymentToken)
+	metrics.PurchasePhase.WithLabelValues(metrics.PhasePaymentCall).Observe(time.Since(payStart).Seconds())
 
 	// --- PHASE 3: TX2 finalization based on the payment outcome.
 	reqID := middleware.GetReqID(r.Context())
+	tx2Start := time.Now()
 	fin, err := booking.Finalize(r.Context(), h.pool, held, tier.ID, userID, reqID, charge)
+	metrics.PurchasePhase.WithLabelValues(metrics.PhaseTX2).Observe(time.Since(tx2Start).Seconds())
 	if err != nil {
 		slog.Error("purchase: TX2 finalize failed", "booking_id", held.BookingID, "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to finalize purchase")
@@ -177,6 +191,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	switch fin.Status {
 	case "confirmed":
+		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeConfirmed).Inc()
 		response.JSON(w, r, http.StatusCreated, map[string]any{
 			"booking_id": held.BookingID,
 			"status":     "confirmed",
@@ -184,6 +199,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 			"reference":  reference(held.BookingID),
 		})
 	case "failed":
+		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeDeclined).Inc()
 		// Tickets released inside TX2; give the inventory back to Redis AFTER
 		// commit, never inside the transaction. ReleaseQty is 0 when the expiry
 		// worker already compensated (the lost-guard race).
@@ -196,11 +212,13 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		response.ErrorWithDetails(w, r, http.StatusPaymentRequired, "payment_declined",
 			"your card was declined", map[string]any{"booking_id": held.BookingID})
 	case "held_unknown":
+		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeAmbiguous).Inc()
 		// Booking stays 'held' as durable evidence; the reconciliation worker
 		// resolves it by querying the provider by idempotency key. We NEVER guess.
 		response.ErrorWithDetails(w, r, http.StatusGatewayTimeout, "payment_processing_unclear",
 			"payment is being verified, check booking status", map[string]any{"booking_id": held.BookingID})
 	case "expired_after_charge":
+		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeExpiredAfterCharge).Inc()
 		// Money moved but the hold had already expired. Recorded for refund.
 		response.ErrorWithDetails(w, r, http.StatusConflict, "booking_expired_after_charge",
 			"your hold expired while payment was processing; a refund will be issued",

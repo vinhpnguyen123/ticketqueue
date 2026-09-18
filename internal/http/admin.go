@@ -51,17 +51,6 @@ func (h *AdminHandler) Mount(r chi.Router) {
 	})
 }
 
-// Categories a stuck booking can fall into.
-const (
-	// categoryHeldTooLong: still 'held' past the threshold — reconciliation has
-	// not resolved it yet. Inventory is frozen; no money is at stake.
-	categoryHeldTooLong = "held_too_long"
-	// categoryChargedNotDelivered: Outcome D (§8) — the money moved but the
-	// booking is failed/cancelled and its tickets may already be resold. These
-	// need a human, because they are money taken with no ticket delivered.
-	categoryChargedNotDelivered = "charged_not_delivered"
-)
-
 type stuckBooking struct {
 	ID        string `json:"id"`
 	Reference string `json:"reference"`
@@ -95,80 +84,30 @@ func (h *AdminHandler) StuckBookings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Two categories, one list. charged_not_delivered comes first because money
-	// is at stake there; held_too_long only freezes inventory.
-	//
-	// payment_status: the most recent RESOLVED payments row. A reconciled
-	// booking legitimately keeps BOTH an 'unknown' row (written by TX2 when the
-	// outcome was ambiguous) and a 'succeeded'/'failed' row (written by the
-	// resolver). The unknown row is HISTORY, not current state — computing this
-	// as "latest payments row" would report already-healed bookings as unknown.
-	// Fall back to 'unknown' only when nothing has resolved yet.
-	//
-	// resolution_source: which path last reconciled the booking. 'purchase' is
-	// excluded on purpose — that is the synchronous path, not a reconcile.
-	rows, err := h.pool.Query(r.Context(),
-		`SELECT x.id, x.user_id, x.status, x.quantity, x.total_cents, x.currency,
-		        x.created_at, x.hold_expires_at, x.category, x.flagged_at,
-		        EXTRACT(EPOCH FROM (NOW() - x.created_at))::int AS age_seconds,
-		        COALESCE((SELECT p.status FROM payments p
-		                  WHERE p.booking_id = x.id AND p.status <> 'unknown'
-		                  ORDER BY p.created_at DESC LIMIT 1), 'unknown') AS payment_status,
-		        (SELECT a.metadata->>'source' FROM audit_log a
-		         WHERE a.entity_type = 'booking' AND a.entity_id = x.id
-		           AND a.metadata->>'source' IN ('reconciliation', 'hold_expiry', 'admin_manual')
-		         ORDER BY a.created_at DESC LIMIT 1) AS resolution_source
-		 FROM (
-		     -- Still held past the threshold; uses idx_booking_stuck.
-		     SELECT b.id, b.user_id, b.status, b.quantity, b.total_cents, b.currency,
-		            b.created_at, b.hold_expires_at,
-		            $1::text AS category, NULL::timestamptz AS flagged_at
-		     FROM booking b
-		     WHERE b.status = 'held' AND b.created_at < NOW() - make_interval(secs => $3)
-		     UNION ALL
-		     -- Money moved, booking is not confirmed; uses idx_audit_entity.
-		     SELECT b.id, b.user_id, b.status, b.quantity, b.total_cents, b.currency,
-		            b.created_at, b.hold_expires_at,
-		            $2::text,
-		            (SELECT MIN(a.created_at) FROM audit_log a
-		             WHERE a.entity_type = 'booking' AND a.entity_id = b.id
-		               AND a.action = 'reconciliation_needed')
-		     FROM booking b
-		     WHERE b.status <> 'confirmed'
-		       AND EXISTS (SELECT 1 FROM audit_log a
-		                   WHERE a.entity_type = 'booking' AND a.entity_id = b.id
-		                     AND a.action = 'reconciliation_needed')
-		 ) x
-		 ORDER BY (x.category = $2) DESC, x.created_at ASC
-		 LIMIT $4`,
-		categoryHeldTooLong, categoryChargedNotDelivered, olderThan, limit)
+	stuck, err := booking.ListStuck(r.Context(), h.pool, time.Duration(olderThan)*time.Second, limit)
 	if err != nil {
 		slog.Error("admin: stuck bookings query", "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to list stuck bookings")
 		return
 	}
-	defer rows.Close()
 
-	out := []stuckBooking{}
-	for rows.Next() {
-		var b stuckBooking
-		var cents int64
-		var currency string
-		if err := rows.Scan(&b.ID, &b.UserID, &b.Status, &b.Quantity, &cents, &currency,
-			&b.CreatedAt, &b.HoldExpiresAt, &b.Category, &b.FlaggedAt,
-			&b.AgeSeconds, &b.PaymentStatus, &b.ResolutionSource); err != nil {
-			slog.Error("admin: scan stuck booking", "error", err)
-			response.Error(w, r, http.StatusInternalServerError, "internal", "failed to list stuck bookings")
-			return
-		}
-		b.Reference = reference(b.ID)
-		b.Total = money{Amount: cents, Currency: currency}
-		out = append(out, b)
-	}
-	if rows.Err() != nil {
-		slog.Error("admin: iterate stuck bookings", "error", rows.Err())
-		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to list stuck bookings")
-		return
+	out := make([]stuckBooking, 0, len(stuck))
+	for _, b := range stuck {
+		out = append(out, stuckBooking{
+			ID:               b.ID,
+			Reference:        reference(b.ID),
+			Category:         b.Category,
+			UserID:           b.UserID,
+			Status:           b.Status,
+			Quantity:         b.Quantity,
+			Total:            money{Amount: b.TotalCents, Currency: b.Currency},
+			CreatedAt:        b.CreatedAt,
+			HoldExpiresAt:    b.HoldExpiresAt,
+			AgeSeconds:       b.AgeSeconds,
+			PaymentStatus:    b.PaymentStatus,
+			FlaggedAt:        b.FlaggedAt,
+			ResolutionSource: b.ResolutionSource,
+		})
 	}
 	response.JSON(w, r, http.StatusOK, out)
 }

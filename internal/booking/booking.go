@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // ErrSoldOut means the tier has fewer available tickets than requested.
@@ -43,6 +45,7 @@ func ReserveInventory(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool
 		case 1:
 			return nil
 		case 0:
+			metrics.RedisLuaReject.Inc()
 			return ErrSoldOut
 		}
 		// Key missing: lazy init from Postgres (the truth), then retry once.
@@ -130,6 +133,9 @@ func HoldTickets(ctx context.Context, pool *pgxpool.Pool, userID string, tier Ti
 	if rows.Err() != nil {
 		return Held{}, fmt.Errorf("iterate tickets: %w", rows.Err())
 	}
+	// Recorded even on the short path below: a claim that came up short is
+	// exactly what this histogram exists to show.
+	metrics.TicketClaimRows.Observe(float64(len(ticketIDs)))
 	if len(ticketIDs) < qty {
 		// The Lua fast path raced ahead of truth (its counter said yes, the
 		// rows say no). Postgres is truth: reject, and let the caller INCRBY

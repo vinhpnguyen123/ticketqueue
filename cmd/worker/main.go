@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
 	"github.com/vinhpnguyen123/ticketqueue/internal/config"
 	"github.com/vinhpnguyen123/ticketqueue/internal/db"
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 	"github.com/vinhpnguyen123/ticketqueue/internal/redis"
 	"github.com/vinhpnguyen123/ticketqueue/internal/worker"
 )
@@ -46,6 +50,25 @@ func main() {
 
 	payments := booking.NewPaymentClient(cfg.PaymentURL, cfg.PaymentKey)
 
+	// The worker owns the money-at-risk gauges, sampled on their own schedule
+	// rather than inside any worker cycle.
+	metrics.Register()
+	go worker.SampleGauges(ctx, pool)
+
+	// VPC-only in a real deploy: never expose /metrics publicly (§11a).
+	metricsSrv := &http.Server{Addr: ":" + cfg.MetricsPort, Handler: metricsMux()}
+	go func() {
+		logger.Info("worker metrics listening", "port", cfg.MetricsPort)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics server failed", "error", err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsSrv.Shutdown(shutdownCtx)
+	}()
+
 	// Each Runner blocks until SIGINT/SIGTERM cancels ctx.
 	var wg sync.WaitGroup
 	runners := []*worker.Runner{
@@ -72,4 +95,11 @@ func main() {
 	wg.Wait()
 
 	logger.Info("shutdown complete")
+}
+
+// metricsMux serves only /metrics, on the worker's own port.
+func metricsMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler())
+	return mux
 }

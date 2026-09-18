@@ -12,6 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // HoldExpiryInterval is how often expired holds are resolved.
@@ -70,6 +71,8 @@ func HoldExpiryCycle(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool,
 	if rows.Err() != nil {
 		return fmt.Errorf("iterate expired holds: %w", rows.Err())
 	}
+
+	metrics.WorkerItems.WithLabelValues(metrics.WorkerHoldExpiry).Add(float64(len(expired)))
 
 	// One bad booking must never abort the batch.
 	failures := 0

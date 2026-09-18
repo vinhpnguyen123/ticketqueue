@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // Vars so tests can shrink the delays instead of sleeping 35s.
@@ -65,6 +67,8 @@ func NewServer(apiKey string) http.Handler {
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	// VPC-only in a real deploy: never expose /metrics publicly.
+	r.Handle("/metrics", metrics.Handler())
 	r.Route("/v1", func(r chi.Router) {
 		r.Use(s.requireAuth)
 		r.Post("/charges", s.createCharge)
@@ -95,6 +99,7 @@ type chargeRequest struct {
 }
 
 func (s *server) createCharge(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	key := r.Header.Get("Idempotency-Key")
 	if key == "" {
 		writeErr(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
@@ -117,6 +122,11 @@ func (s *server) createCharge(w http.ResponseWriter, r *http.Request) {
 	}
 	s.st.mu.RUnlock()
 
+	// token_type is a small fixed set of injection tokens, safe as a label.
+	defer func() {
+		metrics.ChargeDuration.WithLabelValues(req.PaymentToken).Observe(time.Since(start).Seconds())
+	}()
+
 	switch req.PaymentToken {
 	case "tok_visa":
 		s.succeed(w, req, key, card{"visa", "4242"})
@@ -134,6 +144,7 @@ func (s *server) createCharge(w http.ResponseWriter, r *http.Request) {
 		s.succeed(w, req, key, card{"visa", "4242"})
 	case "tok_drops_response":
 		ch := s.record(req, key, "succeeded", card{"visa", "4242"}, "")
+		metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, "dropped").Inc()
 		slog.Info("charge processed, dropping response", "token", req.PaymentToken, "key", key, "charge_id", ch.ID)
 		// Simulates the response being lost on the network AFTER money moved:
 		// the charge is stored (retrievable by key), but the client gets a
@@ -188,12 +199,14 @@ func (s *server) record(req chargeRequest, key, status string, c card, failureCo
 
 func (s *server) succeed(w http.ResponseWriter, req chargeRequest, key string, c card) {
 	ch := s.record(req, key, "succeeded", c, "")
+	metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, "succeeded").Inc()
 	slog.Info("charge attempt", "token", req.PaymentToken, "key", key, "outcome", "succeeded", "charge_id", ch.ID)
 	writeJSON(w, http.StatusOK, ch)
 }
 
 func (s *server) fail(w http.ResponseWriter, req chargeRequest, key, failureCode string) {
 	ch := s.record(req, key, "failed", card{}, failureCode)
+	metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, "failed").Inc()
 	slog.Info("charge attempt", "token", req.PaymentToken, "key", key, "outcome", "failed", "failure_code", failureCode)
 	writeJSON(w, http.StatusPaymentRequired, ch)
 }

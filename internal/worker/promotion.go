@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 	"github.com/vinhpnguyen123/ticketqueue/internal/queue"
 )
 
@@ -87,6 +88,8 @@ func promoteEvent(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, ev
 	if err != nil {
 		return fmt.Errorf("zpopmin queue: %w", err)
 	}
+
+	metrics.WorkerItems.WithLabelValues(metrics.WorkerPromotion).Add(float64(len(popped)))
 
 	for i, z := range popped {
 		userID := z.Member.(string)

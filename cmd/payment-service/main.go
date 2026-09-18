@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 	"github.com/vinhpnguyen123/ticketqueue/internal/paymentsim"
 )
 
@@ -23,6 +24,7 @@ func main() {
 	port := envOr("PAYMENT_PORT", "8081")
 	apiKey := envOr("PAYMENT_API_KEY", "ps_test_localdev")
 
+	metrics.Register()
 	slog.Info("payment-service listening", "port", port)
 	if err := http.ListenAndServe(":"+port, paymentsim.NewServer(apiKey)); err != nil {
 		slog.Error("server exited", "error", err)

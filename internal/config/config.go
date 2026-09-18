@@ -11,6 +11,9 @@ type Config struct {
 	JWTSecret   string
 	PaymentURL  string
 	PaymentKey  string
+	// MetricsPort is where the worker serves /metrics; the API and payment
+	// service use their own main ports.
+	MetricsPort string
 }
 
 // Load reads configuration from the environment, applying local-dev
@@ -25,6 +28,7 @@ func Load() (Config, error) {
 		JWTSecret:   getenv("JWT_SECRET", "change-me-in-real-env"),
 		PaymentURL:  getenv("PAYMENT_URL", "http://localhost:8081"),
 		PaymentKey:  getenv("PAYMENT_API_KEY", "ps_test_localdev"),
+		MetricsPort: getenv("METRICS_PORT", "9091"),
 	}
 	return cfg, nil
 }

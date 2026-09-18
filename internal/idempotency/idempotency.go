@@ -19,6 +19,7 @@ import (
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/auth"
 	"github.com/vinhpnguyen123/ticketqueue/internal/http/response"
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // lockTimeout is how long an uncompleted claim is considered in-flight.
@@ -107,6 +108,8 @@ func Middleware(pool *pgxpool.Pool) func(http.Handler) http.Handler {
 				return
 			}
 
+			metrics.IdempotencyOutcome.WithLabelValues(metrics.IdemNew).Inc()
+
 			// We own the claim: run the handler, capturing its response.
 			holder := &bookingIDHolder{}
 			rec := &recorder{ResponseWriter: w}
@@ -152,12 +155,15 @@ func replayOrReject(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, 
 
 	switch {
 	case storedHash != requestHash:
+		metrics.IdempotencyOutcome.WithLabelValues(metrics.IdemHashMismatch).Inc()
 		response.Error(w, r, http.StatusUnprocessableEntity, "idempotency_key_reuse",
 			"idempotency key was used for a different request")
 	case completedAt == nil && time.Since(lockedAt) <= lockTimeout:
+		metrics.IdempotencyOutcome.WithLabelValues(metrics.IdemInProgress).Inc()
 		response.Error(w, r, http.StatusConflict, "request_in_progress",
 			"a request with this idempotency key is already in progress")
 	case completedAt == nil:
+		metrics.IdempotencyOutcome.WithLabelValues(metrics.IdemInProgress).Inc()
 		// Stale lock: the previous attempt died mid-flight. Do NOT take over
 		// and re-execute — the purchase may be half-done (booking held, charge
 		// outcome unknown). The reconciliation worker (Week 4) resolves the
@@ -165,6 +171,7 @@ func replayOrReject(w http.ResponseWriter, r *http.Request, pool *pgxpool.Pool, 
 		response.Error(w, r, http.StatusConflict, "request_unresolved",
 			"a previous attempt with this key did not complete; check your booking status")
 	default:
+		metrics.IdempotencyOutcome.WithLabelValues(metrics.IdemReplayed).Inc()
 		// Replay the stored response verbatim, no handler invocation.
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Idempotency-Replayed", "true")

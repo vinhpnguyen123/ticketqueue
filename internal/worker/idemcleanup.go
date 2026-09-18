@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // IdemCleanupInterval is how often expired idempotency keys are purged.
@@ -29,6 +31,7 @@ func IdemCleanupCycle(ctx context.Context, pool *pgxpool.Pool) error {
 			break
 		}
 	}
+	metrics.WorkerItems.WithLabelValues(metrics.WorkerIdemCleanup).Add(float64(total))
 	if total > 0 {
 		slog.Info("purged expired idempotency keys", "count", total)
 	}

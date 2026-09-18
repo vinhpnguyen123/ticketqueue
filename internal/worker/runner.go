@@ -6,6 +6,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // Runner runs fn every interval until ctx is cancelled. A panic inside fn
@@ -47,9 +49,14 @@ func (r *Runner) runCycle(ctx context.Context) {
 
 	start := time.Now()
 	err := r.fn(ctx)
+	elapsed := time.Since(start)
+	metrics.WorkerCycleDuration.WithLabelValues(r.name).Observe(elapsed.Seconds())
 	if err != nil && ctx.Err() == nil {
-		slog.Error("worker cycle failed", "worker", r.name, "duration", time.Since(start), "error", err)
+		// A deferral is not an error and is not counted here; only genuine
+		// failures reach this branch.
+		metrics.WorkerErrors.WithLabelValues(r.name).Inc()
+		slog.Error("worker cycle failed", "worker", r.name, "duration", elapsed, "error", err)
 		return
 	}
-	slog.Info("worker cycle done", "worker", r.name, "duration", time.Since(start))
+	slog.Info("worker cycle done", "worker", r.name, "duration", elapsed)
 }

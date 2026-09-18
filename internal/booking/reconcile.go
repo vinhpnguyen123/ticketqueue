@@ -8,6 +8,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
 // StuckAfter is how old a 'held' booking must be before anything treats it as
@@ -67,7 +69,10 @@ func ReconcileBooking(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client
 
 	switch res.Outcome {
 	case Ambiguous:
-		// We could not ask. Leave everything exactly as it is.
+		// We could not ask. Leave everything exactly as it is. The counter
+		// increments on EVERY deferral while the audit row is written once per
+		// booking — three signals, three cadences, on purpose (§11a).
+		metrics.ReconciliationResolution.WithLabelValues(a.Source, metrics.ResolutionDeferred).Inc()
 		return Resolution{Provider: ProviderUnreachable, Status: "held"}, nil
 
 	case Succeeded:
@@ -122,6 +127,10 @@ func ReconcileBooking(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client
 		}
 	}
 
+	// Labelled with the caller's own Actor.Source, so a new caller reports
+	// correctly without touching this function.
+	metrics.ReconciliationResolution.WithLabelValues(a.Source, resolutionOutcome(res.Outcome)).Inc()
+
 	if !out.Applied {
 		// Someone else resolved it first; report what they left behind rather
 		// than guessing.
@@ -131,6 +140,20 @@ func ReconcileBooking(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client
 		}
 	}
 	return out, nil
+}
+
+// resolutionOutcome maps a provider verdict onto the metric's outcome label.
+func resolutionOutcome(o Outcome) string {
+	switch o {
+	case Succeeded:
+		return metrics.ResolutionConfirmed
+	case Declined:
+		return metrics.ResolutionFailed
+	case NotFound:
+		return metrics.ResolutionNoCharge
+	default:
+		return metrics.ResolutionDeferred
+	}
 }
 
 // LoadStuck fetches everything ReconcileBooking needs for one booking, plus its
