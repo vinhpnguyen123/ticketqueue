@@ -11,9 +11,9 @@
 package metrics
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
@@ -234,32 +234,76 @@ var (
 	}, []string{"token_type", "outcome"})
 )
 
-var collectors = []prometheus.Collector{
-	HTTPDuration, PurchasePhase, PurchaseOutcome, TicketClaimRows, RedisLuaReject,
-	IdempotencyOutcome, DBPoolInUse, DBPoolIdle, DBPoolMax, DBPoolAcquireWaitSeconds,
-	DBPoolEmptyAcquire, WorkerCycleDuration, WorkerItems, WorkerErrors,
-	ReconciliationResolution, InventoryDrift, InvariantViolation, BookingsHeld,
-	AdminStuckBookings, ChargeDuration, ChargeOutcome,
-}
+// Each binary registers only what it actually writes. Exposing everything
+// everywhere would mean the API and the payment service both publishing
+// bookings_held_current as a flat zero next to the worker's real value — three
+// lines on a dashboard where only one means anything.
+var (
+	apiCollectors = []prometheus.Collector{
+		HTTPDuration, PurchasePhase, PurchaseOutcome, TicketClaimRows, RedisLuaReject,
+		IdempotencyOutcome, DBPoolInUse, DBPoolIdle, DBPoolMax, DBPoolAcquireWaitSeconds,
+		DBPoolEmptyAcquire,
+		// The API's sync-reconcile-on-retry path resolves bookings too.
+		ReconciliationResolution,
+	}
 
-var registerOnce sync.Once
+	workerCollectors = []prometheus.Collector{
+		WorkerCycleDuration, WorkerItems, WorkerErrors, ReconciliationResolution,
+		InventoryDrift, InvariantViolation, BookingsHeld, AdminStuckBookings,
+		TicketClaimRows, RedisLuaReject,
+	}
 
-// Register registers every collector exactly once. Binaries call it at startup;
-// tests call it freely, because a second call is a no-op rather than a panic.
-func Register() {
-	registerOnce.Do(func() {
-		for _, c := range collectors {
-			prometheus.MustRegister(c)
+	paymentCollectors = []prometheus.Collector{ChargeDuration, ChargeOutcome}
+
+	// allCollectors is every metric exactly once, for tests.
+	allCollectors = dedupe(apiCollectors, workerCollectors, paymentCollectors)
+)
+
+func dedupe(groups ...[]prometheus.Collector) []prometheus.Collector {
+	seen := map[prometheus.Collector]bool{}
+	var out []prometheus.Collector
+	for _, g := range groups {
+		for _, c := range g {
+			if !seen[c] {
+				seen[c] = true
+				out = append(out, c)
+			}
 		}
-	})
+	}
+	return out
 }
 
-// Handler serves the metrics endpoint.
+// register is idempotent per collector rather than per call, so any mix of
+// RegisterAPI/RegisterWorker/Register in any order is safe — a shared sync.Once
+// would silently skip the second group.
+func register(cs []prometheus.Collector) {
+	for _, c := range cs {
+		if err := prometheus.Register(c); err != nil {
+			var already prometheus.AlreadyRegisteredError
+			if errors.As(err, &already) {
+				continue
+			}
+			panic(err) // a genuinely broken collector should fail loudly at startup
+		}
+	}
+}
+
+// RegisterAPI, RegisterWorker and RegisterPayments register the metrics that
+// binary owns. Each is safe to call more than once.
+func RegisterAPI()      { register(apiCollectors) }
+func RegisterWorker()   { register(workerCollectors) }
+func RegisterPayments() { register(paymentCollectors) }
+
+// Register registers every metric. Tests use it; binaries use the specific one
+// for what they own.
+func Register() { register(allCollectors) }
+
+// Handler serves the metrics endpoint. Registration is the binary's job, so a
+// process that only owns some metrics does not publish the rest as flat zeroes.
 //
 // NEVER expose this publicly in the AWS deploy: it describes internal capacity
 // and failure modes. Bind it to the VPC only (§11a).
 func Handler() http.Handler {
-	Register()
 	return promhttp.Handler()
 }
 

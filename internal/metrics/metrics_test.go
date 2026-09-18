@@ -13,11 +13,16 @@ import (
 
 // Test 1: everything registers, and nothing is declared twice.
 func TestRegisterIsSafeAndComplete(t *testing.T) {
+	// Any order, any mix, repeated: registration must never panic and must
+	// never leave a later group unregistered.
+	RegisterAPI()
+	RegisterWorker()
+	RegisterPayments()
 	Register()
-	Register() // a second call must be a no-op, not a panic
+	Register()
 
 	seen := map[string]bool{}
-	for _, c := range collectors {
+	for _, c := range allCollectors {
 		descs := make(chan *prometheus.Desc, 16)
 		go func(c prometheus.Collector) {
 			c.Describe(descs)
@@ -30,8 +35,8 @@ func TestRegisterIsSafeAndComplete(t *testing.T) {
 			seen[d.String()] = true
 		}
 	}
-	if len(seen) < len(collectors) {
-		t.Errorf("described %d descs for %d collectors", len(seen), len(collectors))
+	if len(seen) < len(allCollectors) {
+		t.Errorf("described %d descs for %d collectors", len(seen), len(allCollectors))
 	}
 }
 

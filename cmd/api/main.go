@@ -53,7 +53,7 @@ func main() {
 
 	// Pool saturation is the most likely first bottleneck under load, and it is
 	// invisible in request latency alone.
-	metrics.Register()
+	metrics.RegisterAPI()
 	go metrics.SamplePool(ctx, pool)
 
 	r := chi.NewRouter()

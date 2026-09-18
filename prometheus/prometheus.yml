@@ -1,0 +1,33 @@
+# Local development scrape config. 5s matches the dashboard's resolution, which
+# matters during a load test: a 15s interval hides the ramp where the pool
+# saturates.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # The three binaries run on the host (make run / run-worker / run-payments),
+  # not in compose, so they are reached through the host gateway.
+  #
+  # host.docker.internal works on Docker Desktop (macOS, Windows). On Linux
+  # either add to each compose service:
+  #     extra_hosts: ["host.docker.internal:host-gateway"]
+  # (already set below), or run Prometheus with network_mode: host and use
+  # localhost targets instead.
+  - job_name: ticketqueue-api
+    static_configs:
+      - targets: ["host.docker.internal:8081"]
+        labels:
+          service: api
+
+  - job_name: ticketqueue-worker
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+        labels:
+          service: worker
+
+  - job_name: ticketqueue-payments
+    static_configs:
+      - targets: ["host.docker.internal:8082"]
+        labels:
+          service: payment-service

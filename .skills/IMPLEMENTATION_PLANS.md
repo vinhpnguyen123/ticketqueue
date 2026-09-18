@@ -183,11 +183,11 @@ API (cmd/api):
 
 http_request_duration_seconds — histogram, labels: route (chi route pattern, never raw path), method, status.
 purchase_phase_duration_seconds — histogram, labels: phase (tx1 | payment_call | tx2). THE key metric: shows whether latency is DB contention or provider latency.
-purchase_outcome_total — counter, labels: outcome (confirmed | declined | sold_out | ambiguous | duplicate_blocked | expired_after_charge).
+purchase_outcome_total — counter, labels: outcome (confirmed | declined | sold_out | ambiguous | duplicate_blocked | window_expired | expired_after_charge).
 ticket_claim_rows_affected — histogram. Detects partial claims / Lua-vs-truth races.
 redis_lua_reject_total — counter. Proves Layer 1 filters ~99% before the DB.
 idempotency_outcome_total — counter, labels: outcome (new | replayed | in_progress | hash_mismatch).
-db_pool_in_use / db_pool_idle / db_pool_wait_duration_seconds — from pgxpool.Stat(), sampled by a background goroutine. Connection saturation is the most likely first bottleneck at 10k VU.
+db_pool_in_use / db_pool_idle / db_pool_max / db_pool_acquire_wait_seconds_total / db_pool_empty_acquire_total — from pgxpool.Stat(), sampled by a background goroutine. NOTE: the wait metric is a COUNTER of seconds fed by deltas, not the histogram originally planned — pgxpool exposes only cumulative totals, never per-acquire samples, so a histogram fed by 5s polling would be arithmetic nonsense. rate() of the counter gives the same saturation signal. Connection saturation is the most likely first bottleneck at 10k VU.
 
 Workers (cmd/worker):
 
@@ -195,7 +195,8 @@ worker_cycle_duration_seconds — histogram, label: worker (promotion | hold_exp
 worker_items_processed_total — counter, same label.
 worker_errors_total — counter, same label.
 bookings_held_current — gauge. Rising = reconciliation falling behind or provider down.
-reconciliation_resolution_total — counter, labels: source (reconciliation | hold_expiry | sync_retry | admin), outcome (confirmed | failed | no_charge | deferred). Deferred spikes = provider trouble.
+admin_stuck_bookings_current — gauge, label: category (held_too_long | charged_not_delivered). Same query definitions as the admin stuck-list endpoint, shared via internal/booking/stuck.go so the dashboard and the API cannot disagree. charged_not_delivered > 0 means money is owed to a customer — the one gauge here worth paging a human for.
+reconciliation_resolution_total — counter, labels: source (reconciliation | hold_expiry | sync_retry | admin_manual | webhook), outcome (confirmed | failed | no_charge | deferred). Deferred spikes = provider trouble. Instrumented INSIDE booking.ReconcileBooking and labelled from Actor.Source, so every finalize path reports automatically and audit metadata and metric labels are the same strings. 'webhook' is declared ahead of the endpoint so the label set never has to change.
 inventory_drift_detected_total — counter. Should be ~0; non-zero is a real finding.
 invariant_violation_total — counter. Must be 0. Any non-zero value is a bug.
 
@@ -207,6 +208,9 @@ Grafana dashboard (one dashboard, 4 rows)
 Row 1 — Throughput & outcomes: purchases/sec by outcome, sold-out rate. Row 2 — Latency breakdown: P95 of tx1 / payment_call / tx2 stacked. This is the panel screenshotted for the README. Row 3 — Contention: db_pool_in_use vs max, pool wait duration, ticket claim rows_affected distribution. Row 4 — Recovery: bookings_held_current, reconciliation resolutions by source/outcome, drift detections, invariant violations.
 
 Rules
+Three signals, three cadences, on purpose — never collapse them: slog fires on EVERY occurrence (a provider outage logging every cycle is what tells you it is ongoing); audit is written ONCE per booking per meaningful state fact (expiry_deferred_provider_unreachable is one row per booking, not per cycle); the metric counts EVERY occurrence, aggregated. Verified by TestMetricsDeferralCountsEveryCycleAuditOnce.
+Gauges are sampled by a dedicated 5s goroutine, never inside a worker cycle. Reconciliation runs every 30s and hold-expiry every 5s, so a gauge updated inside a cycle draws a sawtooth that misreads as a problem during load.
+Each binary registers ONLY the metrics it owns (RegisterAPI / RegisterWorker / RegisterPayments). Registering everything everywhere would publish bookings_held_current as a flat zero from the API and the payment service, next to the worker's real value.
 Cheap counters/histograms only. NO high-cardinality labels (never booking_id, user_id, idempotency_key, event_id, raw URL path as a label).
 Instrumentation must never change behavior: record timings AFTER commit/rollback, never add work while holding a row lock.
 slog stays the record for individual events; Prometheus is for aggregate shape. Deferred reconciliation logs to slog, counts to Prometheus.
@@ -260,6 +264,7 @@ DONE — Correctness fix (1): reconciliation scan is a plain read, no FOR UPDATE
 DONE — Shared resolver extracted: booking.ReconcileBooking (internal/booking/reconcile.go), used by the reconciliation worker AND the admin manual-reconcile endpoint. The money path exists once.
 DONE — Admin: stuck-bookings list (GET /v1/admin/bookings/stuck), manual reconcile (POST /v1/admin/bookings/{id}/reconcile, actor 'admin', 503 + booking left held when the provider is unreachable), audit-trail query (GET /v1/admin/audit by entity_id or request_id). auth.RequireAdmin fails closed. 7 integration tests.
 DONE — Correctness fix (2), the money-rule gap (§17): hold-expiration now calls ReconcileBooking before releasing anything and DEFERS when the provider is unreachable (booking stays 'held', tickets stay held, one 'expiry_deferred_provider_unreachable' audit row per booking, slog.Warn every cycle). Its scan is a plain read on idx_booking_reconciliation. §12 tests #7-#12 all present and green with -race.
+DONE — Observability (§11a): internal/metrics with every metric in one file, instrumented across all three binaries; Prometheus + Grafana in docker-compose with a provisioned dashboard committed as JSON (grafana/dashboards/ticketqueue.json, 4 rows, 16 panels). Verified live: all three scrape targets up, 16 of 17 panel queries returning real data after make demo. Remaining manual step: screenshot Row 2 and Row 4 into docs/screenshots/ for the Week 8 README.
 DONE — Booking read endpoints: GET /v1/bookings (cursor pagination on idx_booking_user, limit default 20 cap 50) and GET /v1/bookings/{id} (tickets + payments + payment_status per the §6 rule). NAMING DECISION: the routes are /v1/bookings, not /v1/orders as this plan used to say — the table is booking and every other route says booking; one name per concept. user_id always comes from the JWT; another user's booking answers 404, never 403. A test asserts the raw JSON carries neither idempotency_key nor provider_response.
 DONE — Sync-reconcile-on-retry, the LAST caller of the shared resolver: GET /v1/bookings/{id} resolves a booking that has been 'held' longer than booking.StuckAfter, with Actor.Source 'sync_retry'. Best-effort by design — an unreachable provider returns 'held' with HTTP 200, never an error and never a guess. The LIST endpoint deliberately does not do this: one provider call per row would be a fan-out (test asserts zero provider calls from the list).
 DONE — booking.StuckAfter exported as the single source for the 90s stuck threshold; the reconciliation worker's SQL now reads it via make_interval instead of a literal. Partial progress on the timing-centralization item below.

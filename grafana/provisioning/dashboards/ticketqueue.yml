@@ -1,0 +1,13 @@
+apiVersion: 1
+
+# The dashboard is provisioned from JSON in git, never hand-built in the UI, so
+# it is reviewable and reproducible on a fresh machine.
+providers:
+  - name: ticketqueue
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

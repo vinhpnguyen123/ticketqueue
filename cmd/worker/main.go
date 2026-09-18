@@ -52,7 +52,7 @@ func main() {
 
 	// The worker owns the money-at-risk gauges, sampled on their own schedule
 	// rather than inside any worker cycle.
-	metrics.Register()
+	metrics.RegisterWorker()
 	go worker.SampleGauges(ctx, pool)
 
 	// VPC-only in a real deploy: never expose /metrics publicly (§11a).

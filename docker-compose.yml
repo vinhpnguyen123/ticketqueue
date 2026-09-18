@@ -27,5 +27,37 @@ services:
       timeout: 3s
       retries: 5
 
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    # The three binaries run on the HOST (make run / run-worker / run-payments),
+    # so Prometheus reaches them through the host gateway. Docker Desktop
+    # provides host.docker.internal; this mapping makes it work on Linux too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    ports:
+      - "3000:3000"
+    environment:
+      # Local development only. Never ship these values anywhere real.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 volumes:
   pgdata:
+  promdata:
+  grafanadata:

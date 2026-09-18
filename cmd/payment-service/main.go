@@ -24,7 +24,7 @@ func main() {
 	port := envOr("PAYMENT_PORT", "8081")
 	apiKey := envOr("PAYMENT_API_KEY", "ps_test_localdev")
 
-	metrics.Register()
+	metrics.RegisterPayments()
 	slog.Info("payment-service listening", "port", port)
 	if err := http.ListenAndServe(":"+port, paymentsim.NewServer(apiKey)); err != nil {
 		slog.Error("server exited", "error", err)
