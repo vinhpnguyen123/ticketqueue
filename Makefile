@@ -7,7 +7,7 @@ PORT ?= 8081
 PAYMENT_PORT ?= 8082
 PAYMENT_URL ?= http://localhost:8082
 
-.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo
+.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo load-seed load-storm load-journey load-calibrate verify-run sabotage
 
 up:
 	docker compose up -d
@@ -61,3 +61,31 @@ seed:
 # End-to-end reliability demo; needs run, run-worker and run-payments up.
 demo:
 	bash scripts/demo_reconciliation.sh
+
+# ---- Load testing -----------------------------------------------------------
+# TICKETS=100 is the oversell proof; TICKETS=2000 is the latency proof. Never
+# quote a p(95) taken from the 100-ticket run: it has only 100 samples.
+TICKETS ?= 100
+USERS ?= 2000
+WINDOWS ?= 50
+VUS ?= 2000
+
+load-seed:
+	go run ./cmd/loadseed -tickets=$(TICKETS) -users=$(USERS) -windows=$(WINDOWS)
+
+load-storm:
+	k6 run -e VUS=$(VUS) scripts/k6/purchase_storm.js
+
+load-journey:
+	k6 run -e VUS=$(VUS) scripts/k6/full_journey.js
+
+load-calibrate:
+	k6 run scripts/k6/calibrate.js
+
+# Run after every load test. Exits non-zero if anything is wrong.
+verify-run:
+	bash scripts/verify_run.sh
+
+# Proves the verification suite can actually fail. See scripts/k6/README.md.
+sabotage:
+	docker compose exec -T postgres psql -U ticketqueue -d ticketqueue -f - < scripts/sabotage.sql

@@ -22,3 +22,7 @@ go.work.sum
 .DS_Store
 .idea/
 .vscode/
+
+# Load-test world: 7MB of generated identities with signed JWTs. Regenerate
+# with `make load-seed`; never a source of truth.
+scripts/k6/seed.json
