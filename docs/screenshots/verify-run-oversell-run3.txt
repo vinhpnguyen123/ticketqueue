@@ -1,0 +1,66 @@
+Correctness verification
+
+=== 1. No booking holds more tickets than it paid for (Layer 3) ===
+ result | offending_bookings 
+--------+--------------------
+ PASS   |                  0
+
+
+=== 2. Sold count never exceeds tier capacity (the oversell check) ===
+ result | oversold_tiers 
+--------+----------------
+ PASS   |              0
+
+
+=== 3. Sold tickets == sum of confirmed booking quantities ===
+ result | sold_tickets | confirmed_qty 
+--------+--------------+---------------
+ PASS   |        88304 |         88304
+
+
+=== 4. Nobody got a free ticket (confirmed without a succeeded payment) ===
+ result | free_tickets 
+--------+--------------
+ PASS   |            0
+
+
+=== 5. Nobody paid without getting a ticket (succeeded without confirmed) ===
+ result | paid_for_nothing 
+--------+------------------
+ PASS   |                0
+
+
+=== 6. Confirmed revenue == succeeded payment amounts ===
+ result | booked_cents | charged_cents 
+--------+--------------+---------------
+ PASS   |   4415200000 |    4415200000
+
+
+=== 7a. Ticket count per tier matches quantity_total (drift checker B1) ===
+ result | bad_tiers 
+--------+-----------
+ PASS   |         0
+
+
+=== 7b. No sold ticket on a non-confirmed booking (drift checker B2) ===
+ result | bad_tickets 
+--------+-------------
+ PASS   |           0
+
+
+=== 7c. No held ticket on a failed/cancelled booking (drift checker B3) ===
+ result | bad_tickets 
+--------+-------------
+ PASS   |           0
+
+
+=== 8. Nothing still held after the run settled (5 min) ===
+ result | stuck_bookings 
+--------+----------------
+ PASS   |              0
+
+=== 9. Redis inventory matches Postgres per tier ===
+    (run the drift checker for two cycles first, or in-flight work reads as drift)
+  PASS  1 of 1 on-sale tier(s) agree with Postgres (0 not yet initialised)
+
+ALL CHECKS PASSED

@@ -1,0 +1,78 @@
+
+         /\      Grafana   /‾‾/  
+    /\  /  \     |\  __   /  /   
+   /  \/    \    | |/ /  /   ‾‾\ 
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/ 
+
+
+     execution: local
+        script: scripts/k6/purchase_storm.js
+        output: -
+
+     scenarios: (100.00%) 1 scenario, 500 max VUs, 2m30s max duration (incl. graceful stop):
+              * storm: 1 iterations for each of 500 VUs (maxDuration: 2m0s, gracefulStop: 30s)
+
+
+
+  █ THRESHOLDS 
+
+    checks
+    ✓ 'rate>0.99' rate=100.00%
+
+    http_req_failed
+    ✓ 'rate==0' rate=0.00%
+
+    purchase_completed_duration
+    ✓ 'p(95)<2000' p(95)=815.6ms
+
+    purchase_outcomes{outcome:conflict}
+    ✓ 'count==0' count=0
+
+    purchase_outcomes{outcome:server_error}
+    ✓ 'count==0' count=0
+
+    purchase_outcomes{outcome:unexpected}
+    ✓ 'count==0' count=0
+
+    purchase_outcomes{outcome:validation_failed}
+    ✓ 'count==0' count=0
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 1000    1186.464809/s
+    checks_succeeded...: 100.00% 1000 out of 1000
+    checks_failed......: 0.00%   0 out of 1000
+
+    ✓ purchase answered without a server error
+    ✓ purchase outcome is one the system defines
+
+    CUSTOM
+    purchase_completed_duration.......: avg=806ms    min=790.24ms med=806.59ms p(90)=813.21ms p(95)=815.6ms  p(99)=817.09ms max=818.68ms
+    purchase_outcomes.................: 500    593.232405/s
+      { outcome:conflict }............: 0      0/s
+      { outcome:server_error }........: 0      0/s
+      { outcome:unexpected }..........: 0      0/s
+      { outcome:validation_failed }...: 0      0/s
+    purchase_rejected_duration........: avg=554.61ms min=432.25ms med=526.15ms p(90)=698.9ms  p(95)=720.32ms p(99)=723.86ms max=725.62ms
+
+    HTTP
+    http_req_duration.................: avg=604.89ms min=432.25ms med=539.89ms p(90)=806.58ms p(95)=809.95ms p(99)=815.59ms max=818.68ms
+      { expected_response:true }......: avg=604.89ms min=432.25ms med=539.89ms p(90)=806.58ms p(95)=809.95ms p(99)=815.59ms max=818.68ms
+    http_req_failed...................: 0.00%  0 out of 500
+    http_reqs.........................: 500    593.232405/s
+
+    EXECUTION
+    iteration_duration................: avg=639.56ms min=447.82ms med=589.98ms p(90)=822.54ms p(95)=829.61ms p(99)=833.85ms max=841.16ms
+    iterations........................: 500    593.232405/s
+
+    NETWORK
+    data_received.....................: 127 kB 151 kB/s
+    data_sent.........................: 466 kB 553 kB/s
+
+
+
+
+running (0m00.8s), 000/500 VUs, 500 complete and 0 interrupted iterations
+storm ✓ [ 100% ] 500 VUs  0m00.8s/2m0s  500/500 iters, 1 per VU

@@ -89,15 +89,7 @@ make load-seed TICKETS=2000 USERS=2000 && make load-storm VUS=2000   # latency p
 
 **Never quote a p(95) taken from the 100-ticket run.**
 
-Results, 2026-09-18:
-
-- **(a) oversell proof** — three consecutive runs, 2,000 VUs against a fresh 100-ticket
-  tier each time: **100 sold, 100 sold, 100 sold.** Zero 5xx, zero failed checks, all nine
-  verification checks green after each.
-- **(b) latency proof** — 2,000-ticket tier, 2,000 VUs: all 2,000 sold, zero 5xx,
-  p(95) = **5.25 s**. That crosses the 2 s threshold, and it should: with every request
-  doing real purchase work this run sits well past the ~350/s plateau. See the ceiling
-  table below — the threshold is a promise about ~500 VUs on this hardware, not 2,000.
+Results for both, with raw output, live in [`docs/load-test-results.md`](../../docs/load-test-results.md) §2 and §3.
 
 ## Calibration — find the machine's ceiling, not the app's
 
@@ -152,12 +144,16 @@ buy queue time and nothing else — p(95) tracks Little's law almost exactly (2,
 was 100 tickets, so most of what did arrive was a fast-path rejection. It is not comparable
 to the rows above it.)
 
-**What saturated first: the kernel, not the app.** `kern.ipc.somaxconn` is **128** on macOS.
-With 10,000 simultaneous SYNs and an app taking ~15 s per request, the accept queue
-overflows and the kernel drops connections before the process ever sees them. Proof: k6 sent
-10,000 requests, the API logged exactly **8,351** (100 x 201 + 8,251 x 409) — and the 1,649
-missing ones equal k6's connection-error count exactly. The API process held only 148 file
-descriptors at peak, so fd limits were never the constraint.
+**What saturated first: the connection pool, then the kernel — never the app.**
+`pgxpool MaxConns = 10`, and `db_pool_in_use` sits pinned at 10 from 1,000 VUs upward
+while `payment_call` stays at 5 ms; the 2,000-VU run accumulated ~15,000 s of
+`db_pool_acquire_wait_seconds_total`. That is the application's ceiling here, and it is a
+configuration value. Second, at 10,000 VUs, `kern.ipc.somaxconn` is **128** on macOS: with
+an app taking ~15 s per request the accept queue overflows and the kernel drops connections
+before the process sees them. Proof: k6 sent 10,000 requests, the API logged exactly
+**8,351** (100 x 201 + 8,251 x 409) — and the 1,649 missing ones equal k6's connection-error
+count exactly. The API process held only 148 file descriptors at peak, so fd limits were
+never the constraint. Full breakdown: `docs/load-test-results.md` §4.
 
 **And it still sold exactly 100 of 100 tickets.** Correctness did not depend on the machine
 coping: `make verify-run` passed all nine checks across 18,200 sold tickets and $9.1M of

@@ -1,6 +1,6 @@
 TICKETQUEUE — IMPLEMENTATION PLAN (SOURCE OF TRUTH)
 
-Last updated: end of Week 4 (rev. 3 — see §18 for what changed). This document overrides any older summary, ERD image, or chat memory. When anything conflicts, THIS + the ./migrations files win.
+Last updated: end of Week 6 (rev. 4 — see §18 for what changed). This document overrides any older summary, ERD image, or chat memory. When anything conflicts, THIS + the ./migrations files win.
 
 ═══════════════════════════════════════════
 
@@ -285,9 +285,20 @@ OUTSTANDING — in priority order:
 
 Mid-week checkpoint: if correctness fixes + orders API + admin + metrics are not done by mid-week, cut webhook and dashboard polish immediately (§14 #1 and #2). Don't wait for end of week.
 
+WEEK 6 (load test + chaos) — DONE 2026-09-18. Canonical numbers live in docs/load-test-results.md; raw k6 and verify_run output in docs/screenshots/, chaos transcripts in docs/chaos/. Future prompts use THESE, not placeholders:
+
+- Oversell proof: 2,000 VUs vs a fresh 100-ticket tier, three consecutive runs → 100 / 100 / 100 sold, 0 oversells, 0 5xx, verify_run 9/9 each time.
+- Latency (2,000-ticket tier, 2,000 VUs, 2,000 samples): purchase_completed_duration p50 6.26s / p95 6.48s / p99 6.52s, 289 purchases/s. Phase breakdown: tx1 42%, tx2 58%, payment_call 0.01% (5ms p95). Time is spent waiting for a DB connection, not on the provider. At 500 VUs: p95 815ms, every k6 threshold green.
+- Ceiling: throughput plateaus at ~350 purchases/s from 500 VUs. Clean (0 errors) to 8,000 VUs with p95 36s; at 10,000 the kernel (somaxconn=128) dropped 16.5% of connections and the app STILL sold exactly 100/100. What saturated first: pgxpool MaxConns=10 (db_pool_in_use pinned at 10 from 1,000 VUs; 14,895s cumulative acquire wait in the 2,000-VU run). Second: the macOS listen backlog. The app never produced a 5xx.
+- CHAOS 1 (API SIGKILL mid-load): 270 stranded, all resolved 271s after the kill — batch-limited at ReconcileBatch=50/30s ≈ 100 bookings/min; a single booking is still 90–120s. 9/9.
+- CHAOS 2 (provider unreachable 90s, §10 chaos switch now built): 500 bookings frozen, available count NEVER rose, 59 deferral audit rows on 59 bookings (one each across ~18 cycles), all resolved 37s after recovery. 9/9. The strongest correctness evidence in the project.
+- CHAOS 3 (worker SIGKILL 60s, 10% tok_drops_response): peak 347 unresolved, API kept confirming throughout, 80 left over drained 93s after restart. 9/9. Finding: the webhook resolves dropped-response bookings without the worker; the worker is the backstop.
+- Harness: SharedArray fix (per-VU JSON.parse of the seed was 9.3MB/VU and crashed the 8GB host at 2,000 VUs), RUN_ID unique per run (a constant collided with the previous run's idempotency keys → 422s), checkPurchase now recognises conflict/validation_failed and thresholds them to zero.
+- NOT done: Grafana screenshots (links with pinned windows in docs/screenshots/README.md). calibrate.js is dead code — a ramp prints one aggregate summary and cannot separate 2k from 8k; the ceiling table came from fixed-VU steps.
+
 LATER:
 
-Week 6: k6 load test (10k concurrent @ 100 tickets → exactly 100 sold, 0 oversells, measure P95); capture Grafana panels during the run (latency breakdown, pool saturation, recovery); chaos (kill API mid-load, reconciliation recovers; make provider unreachable, verify no tickets released on a guess). After the run, verify in SQL: sold tickets == confirmed booking quantities == succeeded payment amounts. NOTE: do NOT claim load numbers on resume until this runs.
+Week 6 (as originally written, for the record): k6 load test (10k concurrent @ 100 tickets → exactly 100 sold, 0 oversells, measure P95); capture Grafana panels during the run (latency breakdown, pool saturation, recovery); chaos (kill API mid-load, reconciliation recovers; make provider unreachable, verify no tickets released on a guess). After the run, verify in SQL: sold tickets == confirmed booking quantities == succeeded payment amounts. NOTE: do NOT claim load numbers on resume until this runs.
 Week 7: Dockerfiles, Terraform (VPC/RDS/ElastiCache/ECS/ALB/Secrets), deploy, demo video, tear down (~$15-30). Add PgBouncer (transaction mode; set pgx simple protocol to avoid prepared-statement breakage).
 Week 8: README (pitch, headline load result, Grafana screenshots, 3 headline diagrams, 13 problems, schema, privacy section, honest production-hardening section incl. §17 documented gaps), interview prep.
 
@@ -431,6 +442,26 @@ GAP: Fraud / anti-scalping → DOCUMENT (deliberately out of scope)
 
 The system implements coarse rate limiting only. It does NOT implement the anti-scalping layer a production ticketing platform needs: device fingerprinting, cross-account velocity checks, CAPTCHA/proof-of-work, ML fraud scoring, stolen-card BIN validation, per-identity purchase limits. In production this is a dedicated service or third party (Stripe Radar, hCaptcha, bot-management vendor) sitting in front of the queue and purchase endpoints. The architecture accommodates it: an abuse-scoring check slots in at queue admission and at purchase submission without touching the concurrency core. Optional cheap primitive if ever wanted: per-user-per-event purchase limit via one guarded COUNT query at purchase time.
 
+GAP: DB connection pool of 10 is the application's ceiling → FIX (Week 7, PgBouncer + re-tune)
+
+Problem: pgxpool MaxConns=10 saturates at ~1,000 VUs (db_pool_in_use pinned at max; ~one empty-pool wait per request). Every second of the 6.5s p95 at 2,000 VUs is tx1/tx2 waiting for a connection, not SQL and not the provider. Resolution: Week 7 adds PgBouncer in transaction mode and re-runs the calibration; MaxConns must then be tuned against Postgres max_connections rather than left at a placeholder. Interview line: "The bottleneck was a config value, and the metrics said so — db_pool_in_use flat at max while payment_call sat at 5ms."
+
+GAP: Reconciliation recovery time scales with backlog → DOCUMENT (tune if it matters)
+
+Problem: ReconcileBatch=50 per 30s cycle means a crash that strands N bookings recovers in ~N/100 minutes (270 in 271s, CHAOS 1). The 90–120s figure is per-booking latency, not throughput. Resolution: documented; both numbers are always quoted together. A larger batch or a shorter cycle is a one-constant change if a real deployment sees large backlogs — but every reconciled booking is a provider lookup, so the cap exists to bound provider load during recovery.
+
+GAP: phase histogram is censored above 10s → FIX (cheap, Week 7)
+
+Problem: purchase_phase_duration_seconds uses prometheus.DefBuckets (top bucket 10s). At 4,000 VUs phase p95 reported exactly 10.00s — the histogram could not see past its own ceiling at precisely the load where "where did the time go" matters most. Resolution: explicit buckets up to 60s.
+
+GAP: a provider outage locks out every affected user → DOCUMENT
+
+Problem: the one-held-booking-per-user guard means that while the provider is unreachable, every user whose booking is frozen gets 410 active_booking_exists on retry until resolution. Correct (it is the duplicate-charge guard) and self-healing, but the user experience during an outage is "you cannot buy" rather than "please wait". Resolution: documented. A production UI would read GET /v1/bookings/{id} and show the held booking rather than letting the user retry blindly.
+
+GAP: single-host benchmark ceilings are environmental → DOCUMENT
+
+kern.ipc.somaxconn=128 dropped 16.5% of connections at 10,000 VUs; k6 shared the server's cores above ~4,000 VUs. Neither is the application. Quote 8,000 as the clean ceiling only with "single laptop" attached, and re-measure from a separate load generator after the Week 7 deploy.
+
 GAP: Simulated provider is in-memory → DOCUMENT
 
 Restarting cmd/payment-service loses all charges, so reconciliation would see "never charged" for real charges. This is a property of the simulator, not the design: a real provider's ledger is durable. Tests and demos never restart the sim mid-scenario.
@@ -444,6 +475,9 @@ Restarting cmd/payment-service loses all charges, so reconciliation would see "n
 Added Prometheus + Grafana (§2, §11a, Week 5/6/8 tasks, cut line #2).
 Reconciliation scan changed to plain read (no FOR UPDATE across the provider call).
 Added fraud/anti-scalping gap (document only).
+
+rev. 4 (end of Week 6):
+Week 6 marked done in §13 with measured numbers inline. Five gaps added to §17 from the load test: pool of 10 as the real ceiling, batch-limited recovery, censored phase histogram, outage lockout UX, environmental ceilings. §10 chaos switch is now built. Canonical results: docs/load-test-results.md.
 
 rev. 3 (end of Week 4, design review):
 

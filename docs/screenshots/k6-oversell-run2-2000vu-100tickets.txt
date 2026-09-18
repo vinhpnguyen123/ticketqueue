@@ -1,0 +1,90 @@
+
+         /\      Grafana   /‾‾/  
+    /\  /  \     |\  __   /  /   
+   /  \/    \    | |/ /  /   ‾‾\ 
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/ 
+
+
+     execution: local
+        script: scripts/k6/purchase_storm.js
+        output: -
+
+     scenarios: (100.00%) 1 scenario, 2000 max VUs, 2m30s max duration (incl. graceful stop):
+              * storm: 1 iterations for each of 2000 VUs (maxDuration: 2m0s, gracefulStop: 30s)
+
+
+running (0m00.7s), 2000/2000 VUs, 0 complete and 0 interrupted iterations
+storm   [   0% ] 2000 VUs  0m00.7s/2m0s  0000/2000 iters, 1 per VU
+
+running (0m01.7s), 1963/2000 VUs, 37 complete and 0 interrupted iterations
+storm   [   2% ] 2000 VUs  0m01.7s/2m0s  0037/2000 iters, 1 per VU
+
+running (0m02.7s), 1589/2000 VUs, 411 complete and 0 interrupted iterations
+storm   [  21% ] 2000 VUs  0m02.7s/2m0s  0411/2000 iters, 1 per VU
+
+
+  █ THRESHOLDS 
+
+    checks
+    ✓ 'rate>0.99' rate=100.00%
+
+    http_req_failed
+    ✓ 'rate==0' rate=0.00%
+
+    purchase_completed_duration
+    ✗ 'p(95)<2000' p(95)=2.22s
+
+    purchase_outcomes{outcome:conflict}
+    ✓ 'count==0' count=0
+
+    purchase_outcomes{outcome:server_error}
+    ✓ 'count==0' count=0
+
+    purchase_outcomes{outcome:unexpected}
+    ✓ 'count==0' count=0
+
+    purchase_outcomes{outcome:validation_failed}
+    ✓ 'count==0' count=0
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 4000    1201.093355/s
+    checks_succeeded...: 100.00% 4000 out of 4000
+    checks_failed......: 0.00%   0 out of 4000
+
+    ✓ purchase answered without a server error
+    ✓ purchase outcome is one the system defines
+
+    CUSTOM
+    purchase_completed_duration.......: avg=2.05s min=1.8s  med=1.96s p(90)=2.22s p(95)=2.22s p(99)=2.23s max=2.24s
+    purchase_outcomes.................: 2000   600.546678/s
+      { outcome:conflict }............: 0      0/s
+      { outcome:server_error }........: 0      0/s
+      { outcome:unexpected }..........: 0      0/s
+      { outcome:validation_failed }...: 0      0/s
+    purchase_rejected_duration........: avg=2.46s min=1.2s  med=2.48s p(90)=2.65s p(95)=2.82s p(99)=2.92s max=2.98s
+
+    HTTP
+    http_req_duration.................: avg=2.44s min=1.2s  med=2.48s p(90)=2.64s p(95)=2.77s p(99)=2.9s  max=2.98s
+      { expected_response:true }......: avg=2.44s min=1.2s  med=2.48s p(90)=2.64s p(95)=2.77s p(99)=2.9s  max=2.98s
+    http_req_failed...................: 0.00%  0 out of 2000
+    http_reqs.........................: 2000   600.546678/s
+
+    EXECUTION
+    iteration_duration................: avg=2.6s  min=1.21s med=2.66s p(90)=2.9s  p(95)=3.03s p(99)=3.12s max=3.17s
+    iterations........................: 2000   600.546678/s
+    vus...............................: 1589   min=1589      max=2000
+    vus_max...........................: 2000   min=2000      max=2000
+
+    NETWORK
+    data_received.....................: 483 kB 145 kB/s
+    data_sent.........................: 1.9 MB 560 kB/s
+
+
+
+
+running (0m03.3s), 0000/2000 VUs, 2000 complete and 0 interrupted iterations
+storm ✓ [ 100% ] 2000 VUs  0m03.3s/2m0s  2000/2000 iters, 1 per VU
+time="2026-09-18T19:38:04-04:00" level=error msg="thresholds on metrics 'purchase_completed_duration' have been crossed"
