@@ -56,7 +56,7 @@ func main() {
 			return worker.IdemCleanupCycle(ctx, pool)
 		}),
 		worker.NewRunner("hold-expiry", worker.HoldExpiryInterval, func(ctx context.Context) error {
-			return worker.HoldExpiryCycle(ctx, rdb, pool)
+			return worker.HoldExpiryCycle(ctx, rdb, pool, payments)
 		}),
 		worker.NewRunner("reconciliation", worker.ReconcileInterval, func(ctx context.Context) error {
 			return worker.ReconcileCycle(ctx, rdb, pool, payments)

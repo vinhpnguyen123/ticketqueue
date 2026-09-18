@@ -88,6 +88,19 @@ expiry_deferred_provider_unreachable — hold deadline passed but no provider ve
 inventory_drift_corrected — drift checker rewrote a Redis inventory key.
 invariant_violation — tickets count != quantity_total, or ticket/booking status mismatch. Never auto-fixed.
 queue_entry_abandoned — waiting entry expired by event lifecycle or safety sweep.
+Standard audit metadata keys (keep consistent):
+
+- source — which finalize path resolved the booking. Values: hold_expiry | reconciliation |
+  sync_retry | admin. Carried on booking.Actor.Source and written into the audit row's
+  metadata by the shared ConfirmBooking / FailBooking. Required on every audit row produced
+  by ReconcileBooking, because after the move to the shared resolver the action name alone
+  (booking_failed) no longer distinguishes "hold deadline passed" from "reconciliation swept
+  it up". Same value set feeds the reconciliation_resolution_total{source} metric in §11a, so
+  audit trail and metrics agree by construction.
+- reason — why a booking was failed. Values: no_charge_found | card_declined |
+  provider_unreachable (deferral only).
+- tickets_released — integer count of tickets returned to 'available' by this action. Used to
+  verify Redis compensation matches what the DB actually released.
 
 ═══════════════════════════════════════════
 
@@ -124,11 +137,11 @@ Workers that finish their work INSIDE one transaction (promotion, drift checker,
 Workers that call the payment provider (reconciliation, hold-expiration) scan with a PLAIN READ (no FOR UPDATE), call the provider with no transaction open, then finalize with guarded UPDATEs (WHERE status='held', assert RowsAffected). Holding a lock across the provider call would violate Principle #2. If two workers race on the same booking, the loser gets RowsAffected 0 and skips — safe because provider lookup is side-effect-free.
 ALL workers: guarded UPDATEs only, batch LIMIT per cycle, audit every state change with actor_type 'worker'.
 Promotion (5s) — Option-A capacity count (admitted+unexpired queue_entries) → ZPOPMIN batch → mark admitted + issue purchase_token, jitter 100-400ms → expired-window sweep.
-Hold-expiration (5s) — NOT BUILT AS SPECIFIED as of 2026-09-17: the shipped worker still fails + releases without asking the provider (internal/worker/holdexpiry.go). The spec below is the target; ReconcileBooking now exists, so wiring it in is a small change. Target: held bookings past hold_expires_at → ask the provider by idempotency_key (shared ReconcileBooking, per-call 3s timeout, batch LIMIT so one cycle stays bounded):
+Hold-expiration (5s) — BUILT (internal/worker/holdexpiry.go, via booking.ReconcileBooking; §12 tests #7-#12). Held bookings past hold_expires_at → ask the provider by idempotency_key (shared ReconcileBooking, per-call 3s timeout, batch LIMIT so one cycle stays bounded):
 no charge / charge failed → FailBooking (release tickets, never touch 'sold') → Redis INCRBY after commit.
 charge succeeded → ConfirmBooking (tickets are still held by THIS booking, so confirming is safe).
 provider unreachable → defer: leave 'held', tickets stay held, audit expiry_deferred_provider_unreachable once. Never release on a guess (money rule, §3). (Changed in rev. 3 — previously released tickets without asking the provider. See §17.)
-Reconciliation (30s) — held bookings older than 90s → lookup provider by idempotency_key → confirm / fail / defer. Never guess when provider unreachable. Uses shared ReconcileBooking → ConfirmBooking/FailBooking. BUILT: the resolver lives in internal/booking/reconcile.go (ReconcileBooking + LoadStuck; ConfirmBooking/FailBooking in finalize.go), and is called today by the reconciliation worker and the admin manual-reconcile endpoint. Hold-expiration and sync-reconcile-on-retry still have to be wired to it. Candidate scan uses idx_booking_stuck (migration 000010). In practice reconciliation resolves most stuck bookings at ~90s; hold-expiration is the hard-deadline backstop.
+Reconciliation (30s) — held bookings older than 90s → lookup provider by idempotency_key → confirm / fail / defer. Never guess when provider unreachable. Uses shared ReconcileBooking → ConfirmBooking/FailBooking. BUILT: the resolver lives in internal/booking/reconcile.go (ReconcileBooking + LoadStuck; ConfirmBooking/FailBooking in finalize.go), and is called today by the reconciliation worker, the hold-expiration worker, and the admin manual-reconcile endpoint. Only sync-reconcile-on-retry still has to be wired to it. Every caller passes Actor.Source ('purchase' | 'reconciliation' | 'hold_expiry' | 'admin_manual'), which lands in the audit row's metadata — actor_type alone cannot tell two workers apart. Candidate scan uses idx_booking_stuck (migration 000010). In practice reconciliation resolves most stuck bookings at ~90s; hold-expiration is the hard-deadline backstop.
 Idempotency cleanup (10min) — delete expired keys (batched DELETE ... WHERE ctid IN (SELECT ... LIMIT n) to avoid long locks).
 Drift checker (60s, Week 5) — three jobs, see §17 for details: a. Redis-vs-Postgres inventory: for each on_sale tier, compare inventory:{tier_id} to COUNT(tickets WHERE status='available'). Only correct Redis when the SAME drift is seen on two consecutive cycles (tolerates in-flight TX1s between Lua decrement and commit). Postgres value wins. Audit inventory_drift_corrected, increment inventory_drift_detected_total. b. Invariants (detect + alert, NEVER auto-fix): COUNT(tickets per tier) == quantity_total; no 'sold' ticket attached to a non-confirmed booking; no 'held' ticket attached to a failed/cancelled booking. Violation → audit invariant_violation + ERROR log. c. Abandoned-queue-entry safety sweep (§17).
 
@@ -246,17 +259,17 @@ WEEK 5 (hardening + admin + observability + webhook) — status as of 2026-09-17
 DONE — Correctness fix (1): reconciliation scan is a plain read, no FOR UPDATE, no lock held across the provider call. Proven by TestReconcileHoldsNoLockAcrossProviderCall (a slow provider mid-cycle does not block a concurrent purchase on the same tier).
 DONE — Shared resolver extracted: booking.ReconcileBooking (internal/booking/reconcile.go), used by the reconciliation worker AND the admin manual-reconcile endpoint. The money path exists once.
 DONE — Admin: stuck-bookings list (GET /v1/admin/bookings/stuck), manual reconcile (POST /v1/admin/bookings/{id}/reconcile, actor 'admin', 503 + booking left held when the provider is unreachable), audit-trail query (GET /v1/admin/audit by entity_id or request_id). auth.RequireAdmin fails closed. 7 integration tests.
+DONE — Correctness fix (2), the money-rule gap (§17): hold-expiration now calls ReconcileBooking before releasing anything and DEFERS when the provider is unreachable (booking stays 'held', tickets stay held, one 'expiry_deferred_provider_unreachable' audit row per booking, slog.Warn every cycle). Its scan is a plain read on idx_booking_reconciliation. §12 tests #7-#12 all present and green with -race.
 DONE (extra, not originally planned) — end-to-end demo: scripts/demo_reconciliation.sh + docs/demo.md + `make demo`; migration 000010 idx_booking_stuck; local ports pinned (API 8081, payment service 8082).
 
 OUTSTANDING — in priority order:
 
- Correctness fix (2), the money-rule gap: hold-expiration must call ReconcileBooking before releasing and defer when the provider is unreachable. Now a small change — the resolver already exists. Brings §12 tests #7-#9 with it.
  Admin gap: the stuck list only covers held bookings older than N seconds. The plan also requires bookings carrying a 'reconciliation_needed' audit row (Outcome D: money moved, hold already expired). Those are status='failed', so the current query misses them entirely — and they are the ones that actually need a human, because they need a refund.
  GET /v1/orders (list, cursor, user-scoped), GET /v1/orders/{id} (with sync reconcile if held — wire it to ReconcileBooking), GET /v1/purchases/{id}/status
  Prometheus + Grafana: add to docker-compose, instrument all three binaries per §11a, build the 4-row dashboard ← do BEFORE the Week 6 load test
  Drift checker worker (§9 #5 + §17); plus event-status-change path expires waiting entries on sold_out/closed/cancelled
  Tighten reconciliation timing to 45s threshold / 15s cycle and centralize the timing constants in one place (they currently live in 7: worker const, worker SQL, demo script, docs/demo.md, this plan, and two test files — that drift is the actual bug)
- Integration suite covering all 12 scenarios in §12 — 8 of 12 done (#1-#6, #10 plus the Carl demo). Missing #7-#9 (hold-expiry, blocked on the fix above) and #11-#12 (drift checker, blocked on the worker above).
+ Integration suite covering §12 — the purchase/expiry/reconciliation scenarios are all covered now. Still missing the drift-checker and invariant scenarios, blocked on that worker.
  Webhook POST /webhooks/payment-service (HMAC + timestamp replay protection + event dedup) ← CUT FIRST if behind
 
 Mid-week checkpoint: if correctness fixes + orders API + admin + metrics are not done by mid-week, cut webhook and dashboard polish immediately (§14 #1 and #2). Don't wait for end of week.
@@ -377,7 +390,7 @@ AUDIT_LOG — append-only history, no foreign keys on purpose so it outlives del
 
 ═══════════════════════════════════════════ Gaps identified in design review, with the decided treatment. "Fix" = build it; "Document" = deliberately out of scope, note the boundary.
 
-GAP: Hold-expiration could release tickets for a charged booking → FIX (Week 5, first task)
+GAP: Hold-expiration could release tickets for a charged booking → FIXED (Week 5)
 
 Problem: hold-expiration failed every held booking past hold_expires_at without asking the provider. If the provider was unreachable for longer than 10 minutes (or the server crashed between TX1 and TX2 and the charge actually landed), tickets were released and resold while the original customer may have been charged. Reconciliation could not repair it afterwards because the booking was no longer 'held'. Note: a payments row is NOT a reliable signal here — in the crash-between-TX1-and-TX2 case no payments row exists at all. Only the provider knows. Resolution: hold-expiration calls the shared ReconcileBooking before any release (§9 #2). Release only on "no charge" / "charge failed"; confirm on "charged"; defer on unreachable. Tests §12 #7–#9. Residual race (accepted): provider says "no charge", hold-expiration releases, then an in-flight charge lands. Requires a charge still in flight at the 10-minute mark despite a 3s client timeout — extremely rare. Caught by Outcome D / reconciliation_needed (next gap).
 Interview line: "Hold expiry asks the provider before releasing, and defers when it can't

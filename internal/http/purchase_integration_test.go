@@ -31,6 +31,10 @@ import (
 // paySrvURL is the most recently wired paymentsim URL, for by-key lookups.
 var paySrvURL string
 
+// payClient is the client for that same server, for tests that drive the
+// workers directly (hold expiry now calls the provider).
+var payClient *booking.PaymentClient
+
 // newPurchaseServer wires auth + purchase routes against a real paymentsim
 // httptest server.
 func newPurchaseServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Client) {
@@ -44,6 +48,7 @@ func newPurchaseServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Cl
 
 	pc := booking.NewPaymentClient(pay.URL, "ps_test_localdev")
 	pc.HTTP.Timeout = 1 * time.Second // shorter than the shrunk slow-token delay
+	payClient = pc
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -384,7 +389,7 @@ func TestPurchaseExpiryRaceAfterCharge(t *testing.T) {
 		`UPDATE booking SET hold_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, held.BookingID); err != nil {
 		t.Fatal(err)
 	}
-	if err := worker.HoldExpiryCycle(ctx, rdb, pool); err != nil {
+	if err := worker.HoldExpiryCycle(ctx, rdb, pool, payClient); err != nil {
 		t.Fatalf("expiry cycle: %v", err)
 	}
 
@@ -586,14 +591,15 @@ func TestPurchaseConcurrencyRace(t *testing.T) {
 	}
 }
 
-func TestHoldExpiryReleasesTickets(t *testing.T) {
+// The hold expired on a booking the provider had already charged
+// (tok_drops_response). Before the §17 fix this worker released the tickets and
+// resold the customer's seat. It now asks the provider first and confirms.
+func TestHoldExpiryConfirmsChargedBooking(t *testing.T) {
 	ts, pool, rdb := newPurchaseServer(t)
 	ctx := context.Background()
 	eventID, tierID := seedTier(t, pool, 50000, 10)
 	_, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
 
-	// tok_drops_response leaves the booking 'held' (ambiguous), which is what
-	// the expiry worker acts on. tok_visa would confirm and sell, TX2's job.
 	resp, out := purchase(t, ts, jwtTok, "exp-1",
 		purchaseBodyTok(eventID, tierID, 2, purchaseTok, "tok_drops_response"))
 	if resp.StatusCode != http.StatusGatewayTimeout {
@@ -606,39 +612,39 @@ func TestHoldExpiryReleasesTickets(t *testing.T) {
 		`UPDATE booking SET hold_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, bookingID); err != nil {
 		t.Fatal(err)
 	}
-	if err := worker.HoldExpiryCycle(ctx, rdb, pool); err != nil {
+	if err := worker.HoldExpiryCycle(ctx, rdb, pool, payClient); err != nil {
 		t.Fatalf("cycle: %v", err)
 	}
 
 	var status string
 	pool.QueryRow(ctx, `SELECT status FROM booking WHERE id = $1`, bookingID).Scan(&status)
-	if status != "failed" {
-		t.Errorf("booking status = %s, want failed", status)
+	if status != "confirmed" {
+		t.Errorf("booking status = %s, want confirmed (the card was charged)", status)
 	}
-	var released int
+	var sold int
 	pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM tickets WHERE ticket_tier_id = $1 AND status = 'available' AND booking_id IS NULL`,
-		tierID).Scan(&released)
-	if released != 10 {
-		t.Errorf("available tickets = %d, want 10", released)
+		`SELECT COUNT(*) FROM tickets WHERE booking_id = $1 AND status = 'sold'`, bookingID).Scan(&sold)
+	if sold != 2 {
+		t.Errorf("sold tickets = %d, want 2 (never resold under a paying customer)", sold)
 	}
-	if got := redisInt(t, rdb, booking.InventoryKey(tierID)); got != invBefore+2 {
-		t.Errorf("inventory = %d, want %d", got, invBefore+2)
+	if got := redisInt(t, rdb, booking.InventoryKey(tierID)); got != invBefore {
+		t.Errorf("inventory = %d, want %d (NOT given back)", got, invBefore)
 	}
 	var audits int
 	pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM audit_log WHERE entity_id = $1 AND action IN ('booking_expired','tickets_released')`,
-		bookingID).Scan(&audits)
+		`SELECT COUNT(*) FROM audit_log WHERE entity_id = $1 AND actor_type = 'worker'
+		 AND metadata->>'source' = 'hold_expiry'`, bookingID).Scan(&audits)
 	if audits != 2 {
-		t.Errorf("audit rows = %d, want 2", audits)
+		t.Errorf("hold_expiry audit rows = %d, want 2 (confirmed + payment_succeeded)", audits)
 	}
 
 	// Second cycle: idempotent no-op.
-	if err := worker.HoldExpiryCycle(ctx, rdb, pool); err != nil {
+	if err := worker.HoldExpiryCycle(ctx, rdb, pool, payClient); err != nil {
 		t.Fatalf("second cycle: %v", err)
 	}
-	if got := redisInt(t, rdb, booking.InventoryKey(tierID)); got != invBefore+2 {
-		t.Errorf("inventory after no-op cycle = %d, want %d", got, invBefore+2)
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM payments WHERE booking_id = $1`, bookingID).Scan(&sold)
+	if sold != 2 {
+		t.Errorf("payments rows = %d, want 2 (the unknown attempt + the succeeded resolution)", sold)
 	}
 }
 
@@ -665,17 +671,19 @@ func TestHoldExpiryNeverReleasesSold(t *testing.T) {
 		`UPDATE booking SET hold_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, bookingID); err != nil {
 		t.Fatal(err)
 	}
-	if err := worker.HoldExpiryCycle(ctx, rdb, pool); err != nil {
+	if err := worker.HoldExpiryCycle(ctx, rdb, pool, payClient); err != nil {
 		t.Fatalf("cycle: %v", err)
 	}
 
-	var sold, availableOfBooking int
+	// The provider charged this booking, so both tickets end up sold: the one
+	// already flipped, and the one still held. Nothing is released.
+	var sold, available int
 	pool.QueryRow(ctx, `SELECT COUNT(*) FROM tickets WHERE booking_id = $1 AND status = 'sold'`, bookingID).Scan(&sold)
-	if sold != 1 {
-		t.Errorf("sold tickets touched: count = %d, want 1 untouched", sold)
+	if sold != 2 {
+		t.Errorf("sold tickets = %d, want 2", sold)
 	}
-	pool.QueryRow(ctx, `SELECT COUNT(*) FROM tickets WHERE ticket_tier_id = $1 AND status = 'available'`, tierID).Scan(&availableOfBooking)
-	if availableOfBooking != 9 {
-		t.Errorf("available = %d, want 9 (only the held one released)", availableOfBooking)
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM tickets WHERE ticket_tier_id = $1 AND status = 'available'`, tierID).Scan(&available)
+	if available != 8 {
+		t.Errorf("available = %d, want 8 (nothing released)", available)
 	}
 }

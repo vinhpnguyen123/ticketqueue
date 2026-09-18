@@ -90,7 +90,7 @@ func reconcileOne(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, pc
 			IdemKey: c.idemKey,
 			TierID:  c.tierID,
 		},
-		booking.Actor{Type: "worker"})
+		booking.Actor{Type: "worker", Source: "reconciliation"})
 	if err != nil {
 		return err
 	}

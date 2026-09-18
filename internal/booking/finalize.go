@@ -11,10 +11,16 @@ import (
 // Actor is who caused a state change, for audit_log. Type is one of
 // 'user' | 'worker' | 'system' | 'admin'; UserID and RequestID are written as
 // NULL when empty (a worker has neither).
+//
+// Source names the mechanism, which actor_type alone cannot: two workers both
+// write actor_type 'worker', so without it the trail cannot say whether a
+// booking was failed by hold expiry or by reconciliation. It lands in the
+// audit row's metadata as "source".
 type Actor struct {
 	Type      string
 	UserID    string
 	RequestID string
+	Source    string
 }
 
 // Finalized is TX2's outcome, mapped by the handler to an HTTP response.
@@ -173,7 +179,7 @@ func recordUnknown(ctx context.Context, pool *pgxpool.Pool, held Held, requestID
 		return Finalized{}, fmt.Errorf("insert unknown payment: %w", err)
 	}
 	if err := audit(ctx, tx, held.BookingID, "payment_outcome_unknown",
-		Actor{Type: "system", RequestID: requestID}, nil); err != nil {
+		Actor{Type: "system", RequestID: requestID, Source: "purchase"}, nil); err != nil {
 		return Finalized{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -192,7 +198,7 @@ func finalizeDeclined(ctx context.Context, pool *pgxpool.Pool, held Held, r Char
 	defer tx.Rollback(ctx)
 
 	released, applied, err := FailBooking(ctx, tx, held, "card_declined", &r,
-		Actor{Type: "user", UserID: userID, RequestID: requestID})
+		Actor{Type: "user", UserID: userID, RequestID: requestID, Source: "purchase"})
 	if err != nil {
 		return Finalized{}, err
 	}
@@ -223,7 +229,7 @@ func finalizeConfirmed(ctx context.Context, pool *pgxpool.Pool, held Held, r Cha
 	defer tx.Rollback(ctx)
 
 	tickets, applied, err := ConfirmBooking(ctx, tx, held, r,
-		Actor{Type: "user", UserID: userID, RequestID: requestID})
+		Actor{Type: "user", UserID: userID, RequestID: requestID, Source: "purchase"})
 	if err != nil {
 		return Finalized{}, err
 	}
@@ -235,7 +241,7 @@ func finalizeConfirmed(ctx context.Context, pool *pgxpool.Pool, held Held, r Cha
 			return Finalized{}, err
 		}
 		if err := audit(ctx, tx, held.BookingID, "reconciliation_needed",
-			Actor{Type: "system", RequestID: requestID},
+			Actor{Type: "system", RequestID: requestID, Source: "purchase"},
 			map[string]any{"reason": "charge_succeeded_after_hold_expired", "provider_txn_id": r.TxnID}); err != nil {
 			return Finalized{}, err
 		}
@@ -273,11 +279,22 @@ func insertFailedPayment(ctx context.Context, tx pgx.Tx, held Held, r ChargeResu
 	return nil
 }
 
-func audit(ctx context.Context, tx pgx.Tx, bookingID, action string, a Actor, metadata any) error {
+func audit(ctx context.Context, tx pgx.Tx, bookingID, action string, a Actor, metadata map[string]any) error {
+	if a.Source != "" {
+		if metadata == nil {
+			metadata = map[string]any{}
+		}
+		metadata["source"] = a.Source
+	}
+	// A nil map must reach Postgres as NULL, not as an empty object.
+	var md any
+	if metadata != nil {
+		md = metadata
+	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, metadata, request_id)
 		 VALUES ('booking', $1, $2, $3, $4, $5, $6)`,
-		bookingID, action, a.Type, nullStr(a.UserID), metadata, nullStr(a.RequestID)); err != nil {
+		bookingID, action, a.Type, nullStr(a.UserID), md, nullStr(a.RequestID)); err != nil {
 		return fmt.Errorf("audit %s: %w", action, err)
 	}
 	return nil

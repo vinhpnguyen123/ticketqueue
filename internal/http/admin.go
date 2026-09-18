@@ -151,7 +151,7 @@ func (h *AdminHandler) Reconcile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := booking.ReconcileBooking(r.Context(), h.pool, h.rdb, h.payments, stuck,
-		booking.Actor{Type: "admin", UserID: adminID, RequestID: middleware.GetReqID(r.Context())})
+		booking.Actor{Type: "admin", UserID: adminID, RequestID: middleware.GetReqID(r.Context()), Source: "admin_manual"})
 	if err != nil {
 		slog.Error("admin: reconcile", "booking_id", id, "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to reconcile booking")
