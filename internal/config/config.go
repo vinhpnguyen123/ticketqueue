@@ -14,6 +14,10 @@ type Config struct {
 	// MetricsPort is where the worker serves /metrics; the API and payment
 	// service use their own main ports.
 	MetricsPort string
+	// WebhookSecret signs provider webhooks. Empty disables the receiver:
+	// unsigned webhooks are worse than no webhooks, and reconciliation already
+	// covers everything the webhook does.
+	WebhookSecret string
 }
 
 // Load reads configuration from the environment, applying local-dev
@@ -22,13 +26,14 @@ type Config struct {
 // empty; for now local dev gets a default.
 func Load() (Config, error) {
 	cfg := Config{
-		DatabaseURL: getenv("DATABASE_URL", "postgres://ticketqueue:localdev@localhost:5434/ticketqueue?sslmode=disable"),
-		RedisAddr:   getenv("REDIS_ADDR", "localhost:6379"),
-		Port:        getenv("PORT", "8080"),
-		JWTSecret:   getenv("JWT_SECRET", "change-me-in-real-env"),
-		PaymentURL:  getenv("PAYMENT_URL", "http://localhost:8081"),
-		PaymentKey:  getenv("PAYMENT_API_KEY", "ps_test_localdev"),
-		MetricsPort: getenv("METRICS_PORT", "9091"),
+		DatabaseURL:   getenv("DATABASE_URL", "postgres://ticketqueue:localdev@localhost:5434/ticketqueue?sslmode=disable"),
+		RedisAddr:     getenv("REDIS_ADDR", "localhost:6379"),
+		Port:          getenv("PORT", "8080"),
+		JWTSecret:     getenv("JWT_SECRET", "change-me-in-real-env"),
+		PaymentURL:    getenv("PAYMENT_URL", "http://localhost:8081"),
+		PaymentKey:    getenv("PAYMENT_API_KEY", "ps_test_localdev"),
+		MetricsPort:   getenv("METRICS_PORT", "9091"),
+		WebhookSecret: getenv("WEBHOOK_SECRET", "whsec_localdev"),
 	}
 	return cfg, nil
 }

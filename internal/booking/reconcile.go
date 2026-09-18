@@ -160,11 +160,22 @@ func resolutionOutcome(o Outcome) string {
 // current status so the caller can reject a booking that is no longer held.
 // pgx.ErrNoRows passes through for the handler to map to 404.
 func LoadStuck(ctx context.Context, pool *pgxpool.Pool, bookingID string) (Stuck, string, error) {
+	return scanStuck(pool.QueryRow(ctx,
+		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency, status
+		 FROM booking WHERE id = $1`, bookingID))
+}
+
+// LoadStuckByKey is the same lookup from the provider's side of the bridge: a
+// webhook knows the idempotency key, never our booking id. Uses idx_booking_idem.
+func LoadStuckByKey(ctx context.Context, pool *pgxpool.Pool, idemKey string) (Stuck, string, error) {
+	return scanStuck(pool.QueryRow(ctx,
+		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency, status
+		 FROM booking WHERE idempotency_key = $1`, idemKey))
+}
+
+func scanStuck(row pgx.Row) (Stuck, string, error) {
 	var s Stuck
 	var status string
-	err := pool.QueryRow(ctx,
-		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency, status
-		 FROM booking WHERE id = $1`, bookingID,
-	).Scan(&s.BookingID, &s.IdemKey, &s.TierID, &s.TotalCents, &s.Currency, &status)
+	err := row.Scan(&s.BookingID, &s.IdemKey, &s.TierID, &s.TotalCents, &s.Currency, &status)
 	return s, status, err
 }

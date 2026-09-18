@@ -16,6 +16,7 @@ import (
 var tables = []string{
 	"users", "events", "ticket_tier", "booking", "tickets",
 	"queue_entries", "idempotency_keys", "payments", "audit_log",
+	"webhook_events_seen",
 }
 
 func getenv(key, fallback string) string {

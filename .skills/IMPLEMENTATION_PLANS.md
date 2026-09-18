@@ -95,8 +95,9 @@ Standard audit metadata keys (keep consistent):
   metadata by the shared ConfirmBooking / FailBooking. Required on every audit row produced
   by ReconcileBooking, because after the move to the shared resolver the action name alone
   (booking_failed) no longer distinguishes "hold deadline passed" from "reconciliation swept
-  it up". Same value set feeds the reconciliation_resolution_total{source} metric in §11a, so
-  audit trail and metrics agree by construction.
+  it up". Values: purchase | reconciliation | hold_expiry | sync_retry | admin_manual | webhook. Same value set
+  feeds the reconciliation_resolution_total{source} metric in §11a, so audit trail and metrics agree by
+  construction.
 - reason — why a booking was failed. Values: no_charge_found | card_declined |
   provider_unreachable (deferral only).
 - tickets_released — integer count of tickets returned to 'available' by this action. Used to
@@ -264,6 +265,8 @@ DONE — Correctness fix (1): reconciliation scan is a plain read, no FOR UPDATE
 DONE — Shared resolver extracted: booking.ReconcileBooking (internal/booking/reconcile.go), used by the reconciliation worker AND the admin manual-reconcile endpoint. The money path exists once.
 DONE — Admin: stuck-bookings list (GET /v1/admin/bookings/stuck), manual reconcile (POST /v1/admin/bookings/{id}/reconcile, actor 'admin', 503 + booking left held when the provider is unreachable), audit-trail query (GET /v1/admin/audit by entity_id or request_id). auth.RequireAdmin fails closed. 7 integration tests.
 DONE — Correctness fix (2), the money-rule gap (§17): hold-expiration now calls ReconcileBooking before releasing anything and DEFERS when the provider is unreachable (booking stays 'held', tickets stay held, one 'expiry_deferred_provider_unreachable' audit row per booking, slog.Warn every cycle). Its scan is a plain read on idx_booking_reconciliation. §12 tests #7-#12 all present and green with -race.
+DONE — Webhook receiver POST /webhooks/payment-service (migration 000011 webhook_events_seen): HMAC over the RAW body with hmac.Equal, 5-minute timestamp window in BOTH directions (a clock far ahead would otherwise extend the replay window), event-id dedup via ON CONFLICT DO NOTHING, resolution through the shared resolver with Actor{Type:'system', Source:'webhook'}. Not under /v1 and not behind the JWT middleware — the caller is another system and the signature is its credential. Always 200 for a handled event, duplicates and unknown keys included, because a non-2xx only makes the provider retry something that cannot succeed. The dedup ledger is pruned after 7 days by the idempotency-cleanup worker.
+NOTE on what the webhook does and does not do: it is a LATENCY optimisation only (§14 #1). On the happy path TX2 has already confirmed the booking before the webhook lands, so the webhook is a deliberate no-op — the audit source there stays 'purchase'. It earns its place on the dropped-response path, where it resolves the booking in ~1s instead of waiting for the 30s worker cycle. The provider fires it AFTER writing the charge response, so the webhook does not routinely race TX2; making that race common would exercise the lost-guard branch on every successful purchase for no benefit.
 DONE — Drift checker, the fifth and last worker (§9 #5): two-cycle inventory reconciliation (a single-cycle disagreement is legitimate in-flight TX1 work, and correcting it would push the counter back UP and let the fast path oversell into a claim about to commit), invariants that DETECT and ALERT but never repair, and the abandoned-queue sweep. §12 #11-#12 covered. Fills inventory_drift_detected_total and invariant_violation_total, which were declared in the observability work with nothing writing to them.
 DONE — event.ExpireWaitingEntries (§17 sweep A), unit-tested directly including that it rolls back with its transaction. No caller yet: nothing transitions an event's status in the codebase today.
 DONE — Observability (§11a): internal/metrics with every metric in one file, instrumented across all three binaries; Prometheus + Grafana in docker-compose with a provisioned dashboard committed as JSON (grafana/dashboards/ticketqueue.json, 4 rows, 16 panels). Verified live: all three scrape targets up, 16 of 17 panel queries returning real data after make demo. Remaining manual step: screenshot Row 2 and Row 4 into docs/screenshots/ for the Week 8 README.
@@ -279,7 +282,6 @@ OUTSTANDING — in priority order:
  GET /v1/purchases/{id}/status — OPEN QUESTION, not built. It was listed next to the orders endpoints, but GET /v1/bookings/{id} now returns status plus payment_status and sync-reconciles on read, so a second status route would be a second name for the same answer. Decide: drop it, or keep it as a thin polling alias for clients that do not want the full detail payload.
  Prometheus + Grafana: add to docker-compose, instrument all three binaries per §11a, build the 4-row dashboard ← do BEFORE the Week 6 load test
  Integration suite covering §12 — all twelve scenarios now have tests.
- Webhook POST /webhooks/payment-service (HMAC + timestamp replay protection + event dedup) ← CUT FIRST if behind
 
 Mid-week checkpoint: if correctness fixes + orders API + admin + metrics are not done by mid-week, cut webhook and dashboard polish immediately (§14 #1 and #2). Don't wait for end of week.
 

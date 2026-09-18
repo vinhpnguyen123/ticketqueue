@@ -56,13 +56,21 @@ type store struct {
 type server struct {
 	apiKey string
 	st     *store
+
+	// Webhook delivery, configured via WithWebhook. Empty URL disables it.
+	webhookURL    string
+	webhookSecret string
+	webhookClient *http.Client
 }
 
-func NewServer(apiKey string) http.Handler {
+func NewServer(apiKey string, opts ...Option) http.Handler {
 	s := &server{apiKey: apiKey, st: &store{
 		charges:    make(map[string]charge),
 		failedOnce: make(map[string]bool),
 	}}
+	for _, opt := range opts {
+		opt(s)
+	}
 	r := chi.NewRouter()
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -161,6 +169,9 @@ func (s *server) createCharge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		conn.Close()
+		// The money moved even though the client will never learn it. The
+		// webhook is exactly how ticketqueue finds out.
+		s.notify(ch)
 	case "tok_500_then_succeed":
 		s.st.mu.Lock()
 		burned := s.st.failedOnce[key]
@@ -202,6 +213,7 @@ func (s *server) succeed(w http.ResponseWriter, req chargeRequest, key string, c
 	metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, "succeeded").Inc()
 	slog.Info("charge attempt", "token", req.PaymentToken, "key", key, "outcome", "succeeded", "charge_id", ch.ID)
 	writeJSON(w, http.StatusOK, ch)
+	s.notify(ch)
 }
 
 func (s *server) fail(w http.ResponseWriter, req chargeRequest, key, failureCode string) {
@@ -209,6 +221,7 @@ func (s *server) fail(w http.ResponseWriter, req chargeRequest, key, failureCode
 	metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, "failed").Inc()
 	slog.Info("charge attempt", "token", req.PaymentToken, "key", key, "outcome", "failed", "failure_code", failureCode)
 	writeJSON(w, http.StatusPaymentRequired, ch)
+	s.notify(ch)
 }
 
 func (s *server) getByKey(w http.ResponseWriter, r *http.Request) {

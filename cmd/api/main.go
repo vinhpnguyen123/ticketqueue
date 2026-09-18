@@ -76,6 +76,9 @@ func main() {
 	api.NewPurchaseHandler(pool, rdb, cfg.JWTSecret, payments).Mount(r)
 	api.NewBookingsHandler(pool, rdb, cfg.JWTSecret, payments).Mount(r)
 	api.NewAdminHandler(pool, rdb, cfg.JWTSecret, payments).Mount(r)
+	// Not under /v1 and not behind the JWT middleware: the caller is another
+	// system and its credential is the HMAC signature.
+	api.NewWebhookHandler(pool, rdb, cfg.WebhookSecret, payments).Mount(r)
 
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 

@@ -25,8 +25,19 @@ func main() {
 	apiKey := envOr("PAYMENT_API_KEY", "ps_test_localdev")
 
 	metrics.RegisterPayments()
+
+	// Webhooks are optional: unset WEBHOOK_URL and the provider simply stays
+	// quiet, which is a supported configuration because reconciliation already
+	// resolves every booking without it.
+	var opts []paymentsim.Option
+	webhookURL := os.Getenv("WEBHOOK_URL")
+	if webhookURL != "" {
+		opts = append(opts, paymentsim.WithWebhook(webhookURL, envOr("WEBHOOK_SECRET", "whsec_localdev")))
+		slog.Info("webhook delivery enabled", "url", webhookURL)
+	}
+
 	slog.Info("payment-service listening", "port", port)
-	if err := http.ListenAndServe(":"+port, paymentsim.NewServer(apiKey)); err != nil {
+	if err := http.ListenAndServe(":"+port, paymentsim.NewServer(apiKey, opts...)); err != nil {
 		slog.Error("server exited", "error", err)
 		os.Exit(1)
 	}
