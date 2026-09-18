@@ -69,6 +69,10 @@ func main() {
 		_ = metricsSrv.Shutdown(shutdownCtx)
 	}()
 
+	// The drift checker is the one worker that carries state between cycles
+	// (the two-cycle inventory confirmation rule).
+	drift := worker.NewDriftChecker()
+
 	// Each Runner blocks until SIGINT/SIGTERM cancels ctx.
 	var wg sync.WaitGroup
 	runners := []*worker.Runner{
@@ -83,6 +87,9 @@ func main() {
 		}),
 		worker.NewRunner("reconciliation", worker.ReconcileInterval, func(ctx context.Context) error {
 			return worker.ReconcileCycle(ctx, rdb, pool, payments)
+		}),
+		worker.NewRunner("drift", worker.DriftInterval, func(ctx context.Context) error {
+			return drift.Cycle(ctx, rdb, pool)
 		}),
 	}
 	for _, r := range runners {

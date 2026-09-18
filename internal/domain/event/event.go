@@ -209,3 +209,28 @@ func (r *Repo) loadTiers(ctx context.Context, events []EventWithTiers) error {
 	}
 	return nil
 }
+
+// ExpireWaitingEntries marks everyone still waiting for an event as expired.
+//
+// Call this IN THE SAME TRANSACTION as a status change to sold_out, closed or
+// cancelled: if the status commits and this does not, people keep queueing for
+// an event that is already over, and only the drift checker's 60s sweep will
+// notice. Taking a pgx.Tx rather than a pool is what enforces that.
+//
+// No caller yet — nothing in the codebase transitions an event's status today.
+// It exists so the admin status endpoint has the correct primitive waiting for
+// it, rather than being tempted to write the UPDATE inline. The drift checker's
+// Job C is the safety net for paths that forget.
+//
+// The Redis waiting set is NOT touched here: Postgres first, Redis second
+// (§3 #1). The caller removes the members after its transaction commits, and a
+// lost removal is healed by the sweep.
+func ExpireWaitingEntries(ctx context.Context, tx pgx.Tx, eventID string) (int, error) {
+	tag, err := tx.Exec(ctx,
+		`UPDATE queue_entries SET status = 'expired', left_at = NOW()
+		 WHERE event_id = $1 AND status = 'waiting'`, eventID)
+	if err != nil {
+		return 0, fmt.Errorf("expire waiting entries: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
