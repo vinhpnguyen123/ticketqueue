@@ -235,8 +235,34 @@ func finalizeConfirmed(ctx context.Context, pool *pgxpool.Pool, held Held, r Cha
 	}
 
 	if !applied {
-		// The expiry worker won and released the tickets, but the charge
-		// succeeded. hold_expires_at is 10min precisely to make this rare.
+		// Someone else finalized this booking while the charge was in flight.
+		// WHICH someone matters, and since hold-expiration started asking the
+		// provider first (§17 fix) there are two possibilities, not one.
+		var current string
+		if err := tx.QueryRow(ctx,
+			`SELECT status FROM booking WHERE id = $1`, held.BookingID).Scan(&current); err != nil {
+			return Finalized{}, fmt.Errorf("re-read booking status: %w", err)
+		}
+
+		if current == "confirmed" {
+			// A sibling asked the provider, got the same 'succeeded' answer we
+			// did, and already confirmed the booking and recorded the payment.
+			// Nothing to record and nothing to flag: the customer has their
+			// tickets. Recording here would duplicate the payments row and
+			// raise a false refund alarm.
+			ids, err := soldTicketIDs(ctx, tx, held.BookingID)
+			if err != nil {
+				return Finalized{}, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Finalized{}, fmt.Errorf("commit: %w", err)
+			}
+			return Finalized{Status: "confirmed", Tickets: ids}, nil
+		}
+
+		// True Outcome D: the booking is failed/cancelled, the money moved, and
+		// the tickets may already be resold. Record the payment and flag it for
+		// a human — this is the one case that needs a refund.
 		if err := insertSucceededPayment(ctx, tx, held, r); err != nil {
 			return Finalized{}, err
 		}
@@ -255,6 +281,28 @@ func finalizeConfirmed(ctx context.Context, pool *pgxpool.Pool, held Held, r Cha
 		return Finalized{}, fmt.Errorf("commit: %w", err)
 	}
 	return Finalized{Status: "confirmed", Tickets: tickets}, nil
+}
+
+// soldTicketIDs lists the tickets a confirmed booking owns.
+func soldTicketIDs(ctx context.Context, tx pgx.Tx, bookingID string) ([]string, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT id FROM tickets WHERE booking_id = $1 AND status = 'sold' ORDER BY id`, bookingID)
+	if err != nil {
+		return nil, fmt.Errorf("read sold tickets: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan sold ticket: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if rows.Err() != nil {
+		return nil, fmt.Errorf("iterate sold tickets: %w", rows.Err())
+	}
+	return ids, nil
 }
 
 func insertSucceededPayment(ctx context.Context, tx pgx.Tx, held Held, r ChargeResult) error {

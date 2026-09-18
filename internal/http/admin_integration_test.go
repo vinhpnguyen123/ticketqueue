@@ -22,6 +22,7 @@ import (
 	api "github.com/vinhpnguyen123/ticketqueue/internal/http"
 	"github.com/vinhpnguyen123/ticketqueue/internal/paymentsim"
 	"github.com/vinhpnguyen123/ticketqueue/internal/testutil"
+	"github.com/vinhpnguyen123/ticketqueue/internal/worker"
 )
 
 // newAdminServer wires the admin routes against a real paymentsim, returning
@@ -358,3 +359,154 @@ func TestAdminAuditRequiresOneSelector(t *testing.T) {
 }
 
 const uuidZero = "00000000-0000-0000-0000-000000000000"
+
+// outcomeD builds a real Outcome D booking: the hold expired and was released
+// while a charge that actually succeeded was still in flight. Money moved, the
+// booking is failed, the tickets are gone — the case that needs a human.
+func outcomeD(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, pc *booking.PaymentClient, tierID, key string) booking.Held {
+	t.Helper()
+	ctx := context.Background()
+	held := seedHeld(t, pool, rdb, tierID, key, 2, 0)
+
+	// The provider never saw this key, so hold-expiry releases the tickets.
+	if _, err := pool.Exec(ctx,
+		`UPDATE booking SET hold_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+		held.BookingID); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.HoldExpiryCycle(ctx, rdb, pool, pc); err != nil {
+		t.Fatalf("expiry cycle: %v", err)
+	}
+
+	// ...and only then does TX2 come back with a succeeded charge.
+	fin, err := booking.Finalize(ctx, pool, held, tierID, "", "req-d",
+		booking.ChargeResult{Outcome: booking.Succeeded, TxnID: "ch_" + key, CardBrand: "visa", CardLast4: "4242"})
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if fin.Status != "expired_after_charge" {
+		t.Fatalf("finalize status = %s, want expired_after_charge", fin.Status)
+	}
+	return held
+}
+
+// rowFor finds a booking in the stuck list, or nil.
+func rowFor(rows []any, bookingID string) map[string]any {
+	for _, raw := range rows {
+		row := raw.(map[string]any)
+		if row["id"] == bookingID {
+			return row
+		}
+	}
+	return nil
+}
+
+// Tests 2+3: an Outcome D booking is surfaced as charged_not_delivered, with a
+// flagged_at, and sorts ahead of a merely-held booking.
+func TestAdminStuckSurfacesChargedNotDelivered(t *testing.T) {
+	ts, pool, rdb, pc, adminTok, _ := newAdminServer(t)
+	_, tierID := seedTier(t, pool, 50000, 20)
+
+	heldOld := seedHeld(t, pool, rdb, tierID, "adm-held-old", 1, 600)
+	charged := outcomeD(t, pool, rdb, pc, tierID, "adm-outcome-d")
+
+	resp, out := adminReq(t, ts, http.MethodGet, "/v1/admin/bookings/stuck", adminTok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%v, want 200", resp.StatusCode, out)
+	}
+	rows := adminList(t, out)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2 (%v)", len(rows), rows)
+	}
+
+	first := rows[0].(map[string]any)
+	if first["category"] != "charged_not_delivered" {
+		t.Errorf("first row category = %v, want charged_not_delivered (money comes first)", first["category"])
+	}
+	if first["id"] != charged.BookingID {
+		t.Errorf("first row = %v, want the Outcome D booking", first["id"])
+	}
+	if first["flagged_at"] == nil {
+		t.Errorf("flagged_at is null on a charged_not_delivered row: %v", first)
+	}
+	if first["status"] != "failed" {
+		t.Errorf("status = %v, want failed (tickets were released)", first["status"])
+	}
+	if first["payment_status"] != "succeeded" {
+		t.Errorf("payment_status = %v, want succeeded (the money moved)", first["payment_status"])
+	}
+
+	second := rows[1].(map[string]any)
+	if second["category"] != "held_too_long" || second["id"] != heldOld.BookingID {
+		t.Errorf("second row = %v, want the held booking as held_too_long", second)
+	}
+	if second["flagged_at"] != nil {
+		t.Errorf("flagged_at should be null on a held_too_long row, got %v", second["flagged_at"])
+	}
+}
+
+// Tests 4+5+6: the regression that motivated the fix. A booking that was
+// reconciled to 'confirmed' keeps an 'unknown' payments row forever; it must
+// NOT be listed, and its payment status must read from the resolved row.
+func TestAdminStuckExcludesHealedBooking(t *testing.T) {
+	ts, pool, rdb, pc, adminTok, _ := newAdminServer(t)
+	ctx := context.Background()
+	_, tierID := seedTier(t, pool, 50000, 10)
+
+	held := seedHeld(t, pool, rdb, tierID, "adm-healed", 2, 600)
+
+	// Ambiguous outcome → TX2 leaves it held and writes the 'unknown' row.
+	fin, err := booking.Finalize(ctx, pool, held, tierID, "", "req-h",
+		booking.ChargeResult{Outcome: booking.Ambiguous})
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if fin.Status != "held_unknown" {
+		t.Fatalf("finalize status = %s, want held_unknown", fin.Status)
+	}
+	// The provider did charge; the reconciliation worker heals it.
+	if res := pc.Charge(ctx, "adm-healed", held.TotalCents, held.Currency, "tok_visa"); res.Outcome != booking.Succeeded {
+		t.Fatalf("setup charge outcome = %v", res.Outcome)
+	}
+	if err := worker.ReconcileCycle(ctx, rdb, pool, pc); err != nil {
+		t.Fatalf("reconcile cycle: %v", err)
+	}
+
+	// Both payments rows exist — this is the shape that used to read 'unknown'.
+	var payments int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM payments WHERE booking_id = $1`, held.BookingID).Scan(&payments)
+	if payments != 2 {
+		t.Fatalf("payments rows = %d, want 2 (unknown + succeeded)", payments)
+	}
+
+	resp, out := adminReq(t, ts, http.MethodGet, "/v1/admin/bookings/stuck", adminTok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%v", resp.StatusCode, out)
+	}
+	if row := rowFor(adminList(t, out), held.BookingID); row != nil {
+		t.Errorf("healed booking appears in the stuck list: %v", row)
+	}
+
+	// Force it back into the list to inspect how its fields read.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type)
+		 VALUES ('booking', $1, 'reconciliation_needed', 'system')`, held.BookingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE booking SET status = 'failed', confirmed_at = NULL, failed_at = NOW() WHERE id = $1`,
+		held.BookingID); err != nil {
+		t.Fatal(err)
+	}
+	_, out = adminReq(t, ts, http.MethodGet, "/v1/admin/bookings/stuck", adminTok)
+	row := rowFor(adminList(t, out), held.BookingID)
+	if row == nil {
+		t.Fatalf("booking missing after being flagged: %v", out)
+	}
+	if row["payment_status"] != "succeeded" {
+		t.Errorf("payment_status = %v, want succeeded — the 'unknown' row is history, not state", row["payment_status"])
+	}
+	if row["resolution_source"] != "reconciliation" {
+		t.Errorf("resolution_source = %v, want reconciliation", row["resolution_source"])
+	}
+}

@@ -687,3 +687,62 @@ func TestHoldExpiryNeverReleasesSold(t *testing.T) {
 		t.Errorf("available = %d, want 8 (nothing released)", available)
 	}
 }
+
+// The benign twin of the expiry race: hold-expiry asked the provider, got the
+// same 'succeeded' answer TX2 has, and confirmed the booking first. TX2's
+// guarded UPDATE loses — but the customer HAS their tickets, so this must not
+// duplicate the payment or raise a refund flag.
+func TestPurchaseSiblingConfirmedFirst(t *testing.T) {
+	_, pool, rdb := newPurchaseServer(t)
+	ctx := context.Background()
+	eventID, tierID := seedTier(t, pool, 50000, 10)
+	userID, _, _ := admittedUser(t, pool, eventID, 1)
+	rdb.Set(ctx, booking.InventoryKey(tierID), 10, 0)
+
+	tier, err := booking.LoadTier(ctx, pool, tierID)
+	if err != nil {
+		t.Fatalf("load tier: %v", err)
+	}
+	held, err := booking.HoldTickets(ctx, pool, userID, tier, 2, "sibling-1", "req-s")
+	if err != nil {
+		t.Fatalf("TX1: %v", err)
+	}
+	// The provider really did charge this key.
+	if res := payClient.Charge(ctx, "sibling-1", held.TotalCents, held.Currency, "tok_visa"); res.Outcome != booking.Succeeded {
+		t.Fatalf("setup charge outcome = %v", res.Outcome)
+	}
+
+	// Hold expires; the worker asks, learns it was charged, and confirms.
+	if _, err := pool.Exec(ctx,
+		`UPDATE booking SET hold_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, held.BookingID); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.HoldExpiryCycle(ctx, rdb, pool, payClient); err != nil {
+		t.Fatalf("expiry cycle: %v", err)
+	}
+
+	// Only now does TX2 finalize the same succeeded charge.
+	fin, err := booking.Finalize(ctx, pool, held, tierID, userID, "req-s",
+		booking.ChargeResult{Outcome: booking.Succeeded, TxnID: "ch_sibling", CardBrand: "visa", CardLast4: "4242"})
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if fin.Status != "confirmed" {
+		t.Errorf("finalize status = %s, want confirmed (the customer has their tickets)", fin.Status)
+	}
+	if len(fin.Tickets) != 2 {
+		t.Errorf("tickets returned = %d, want 2", len(fin.Tickets))
+	}
+
+	var payments, flags int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM payments WHERE booking_id = $1`, held.BookingID).Scan(&payments)
+	if payments != 1 {
+		t.Errorf("payments rows = %d, want exactly 1 (no duplicate for one charge)", payments)
+	}
+	pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM audit_log WHERE entity_id = $1 AND action = 'reconciliation_needed'`,
+		held.BookingID).Scan(&flags)
+	if flags != 0 {
+		t.Errorf("reconciliation_needed rows = %d, want 0 (nothing to refund)", flags)
+	}
+}
