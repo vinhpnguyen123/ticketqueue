@@ -323,6 +323,75 @@ an optional feature. Fixed in one place (`db.JSONB`) with an explicit `::jsonb`
 cast at all eight call sites, which behaves identically under both protocols, so
 there is no PgBouncer-only code path to keep in sync.
 
+## 9. Index and audit tuning (2026-09-19)
+
+Three fixes found with `pg_stat_statements` and `EXPLAIN (ANALYZE, BUFFERS)`,
+committed separately so each carries its own evidence.
+
+### Query-level results — deterministic, measured per fix
+
+| Fix | Query | Before | After |
+|---|---|---:|---:|
+| 1 | TX1 claim (`SKIP LOCKED`), on the 258k-ticket tier | 48.4 ms / 41,667 buffers | **0.07 ms / 5 buffers** |
+| 1 | Tier availability `COUNT(*)`, warm | 18.5 ms / 1,508 buffers | **11.1 ms / 1,681 buffers** |
+| 2 | Stuck gauge, `charged_not_delivered` branch | Parallel Seq Scan, 11,418 buffers | **1 buffer** |
+| 2 | Stuck gauge, whole query | 11,452 buffers | **32 buffers** |
+
+Fix 1 replaced `idx_tickets_claim(ticket_tier_id, status)` with
+`(ticket_tier_id, id)`: `status` was dead weight inside a partial index that
+already filters on it, and nothing in the key matched `ORDER BY id`, so there
+was no good plan — only two bad ones the planner alternated between (index +
+Sort at 471 ms, or `tickets_pkey` with a filter at 48 ms). Costs 6.6× index size
+(1,848 kB → 12 MB): a unique `id` per entry defeats B-tree deduplication, which
+had been compressing the old repeated keys.
+
+Fix 2 added an 8 KB partial index on `audit_log(entity_id) WHERE
+action='reconciliation_needed'`, so the planner drives the gauge's `EXISTS` from
+the tiny table instead of seq-scanning `booking` for the unindexable
+`status <> 'confirmed'`. No SQL changed; the planner picked it up on its own.
+
+Fix 3 dropped `idx_audit_actor` (20 MB, nothing filters on `actor_user_id`),
+merged `booking_created` + `tickets_held` into one row, and removed the
+redundant `tier_id` from metadata.
+
+### Profile shift — `pg_stat_statements`, 10,000 purchases
+
+| | Before | After |
+|---|---:|---:|
+| TX1 claim query | **#1, 19.2%**, 3.35 ms mean | **#10, 3.9%**, 0.19 ms mean |
+| `audit_log` inserts | 24.5%, 4.15 rows/purchase | **15.8%**, 3 rows/purchase |
+| New top entry | — | `INSERT INTO booking`, 20.4% |
+
+The claim query left the top of the profile, which was the goal.
+
+### End-to-end throughput — no measurable change, and that is the finding
+
+Five passes, 2,000 VUs against a 3,000-ticket tier, same configuration as §7(a):
+
+| | Passes | Median |
+|---|---|---:|
+| Before (§7a) | 235.2 / 212.2 / 257.2 | **235.2/s** |
+| After | 208.2 / 254.4 / 252.9 / 159.4 / 191.5 | **208.2/s** |
+
+The ranges overlap almost entirely, so the honest reading is **no measurable
+change**, not a regression. Two reasons, both worth stating:
+
+1. **The benchmark tier is small.** The 48 ms → 0.07 ms win was measured on a
+   258k-ticket tier accumulated over the project's life. The storm runs against
+   3,000 tickets, where even the bad plan only sorted ~3,000 rows. Fix 1 matters
+   most as a tier grows, and the benchmark does not exercise that.
+2. **§4 still holds.** Postgres was at 749–788% of 800% CPU before any of this,
+   and making individual queries cheaper does not change a service rate set by
+   total CPU across ~10 indexed writes per purchase. Cheaper queries mean more
+   headroom, not more throughput, until something else gives.
+
+**So the Week 6 conclusion does not change.** The bottleneck is still database
+CPU, not any single query. That was worth confirming rather than assuming: these
+fixes were exactly the kind that *could* have overturned it, and did not.
+
+Verification: integration suite green 3× through PgBouncer and once direct,
+`make demo` PASS (recovered in 116 s), `verify_run.sh` 9/9.
+
 ## Numbers to carry forward
 
 The resume and README should carry these, with the qualifier attached:
