@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/auth"
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	"github.com/vinhpnguyen123/ticketqueue/internal/domain/user"
 	"github.com/vinhpnguyen123/ticketqueue/internal/http/response"
 	"github.com/vinhpnguyen123/ticketqueue/internal/ratelimit"
@@ -212,10 +213,15 @@ func (h *AuthHandler) issueToken(u user.User) (string, time.Time, error) {
 }
 
 func (h *AuthHandler) audit(r *http.Request, entityID, action string, actorUserID *string, metadata map[string]any) {
-	_, err := h.pool.Exec(r.Context(),
+	md, err := db.JSONB(metadata)
+	if err != nil {
+		slog.Error("audit log metadata encode failed", "action", action, "error", err)
+		return
+	}
+	_, err = h.pool.Exec(r.Context(),
 		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, metadata, request_id)
-		 VALUES ('user', $1, $2, 'user', $3, $4, $5)`,
-		entityID, action, actorUserID, metadata, middleware.GetReqID(r.Context()),
+		 VALUES ('user', $1, $2, 'user', $3, $4::jsonb, $5)`,
+		entityID, action, actorUserID, md, middleware.GetReqID(r.Context()),
 	)
 	if err != nil {
 		slog.Error("audit log insert failed", "action", action, "error", err)

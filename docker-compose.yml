@@ -17,6 +17,26 @@ services:
       timeout: 3s
       retries: 5
 
+  # PgBouncer in transaction mode. Week 7 deploys this in front of RDS; running
+  # it locally first is deliberate — the pgx prepared-statement incompatibility
+  # (internal/db/pool.go) passes a smoke test and fails under concurrency, and
+  # that is not a thing to discover inside ECS.
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "6432:6432"
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "PGPASSWORD=localdev psql -h 127.0.0.1 -p 6432 -U ticketqueue -d pgbouncer -tAc 'SHOW POOLS' >/dev/null 2>&1 || nc -z 127.0.0.1 6432"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   redis:
     image: redis:7-alpine
     ports:
@@ -56,6 +76,60 @@ services:
       - grafanadata:/var/lib/grafana
     depends_on:
       - prometheus
+
+  # ---- The three binaries, as the images that will be deployed ----------------
+  # Behind `--profile app` so `make up` stays exactly as it was: the everyday
+  # loop is still `go run`, which rebuilds in a second. This profile exists to
+  # test the artifact, not to replace the workflow.
+  #
+  # They talk to postgres through PGBOUNCER, because that is the Week 7 topology
+  # and the point of doing this locally is to find the mismatch here.
+  api:
+    profiles: ["app"]
+    image: ticketqueue/api:${IMAGE_TAG:-local}
+    depends_on:
+      pgbouncer: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgres://ticketqueue:localdev@pgbouncer:6432/ticketqueue?sslmode=disable
+      PGBOUNCER: "true"
+      POOL_MAX_CONNS: "${POOL_MAX_CONNS:-10}"
+      REDIS_ADDR: redis:6379
+      PORT: "8080"
+      PAYMENT_URL: http://payment-service:8082
+      WEBHOOK_SECRET: whsec_localdev
+    ports:
+      - "8081:8080"
+
+  worker:
+    profiles: ["app"]
+    image: ticketqueue/worker:${IMAGE_TAG:-local}
+    depends_on:
+      pgbouncer: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      DATABASE_URL: postgres://ticketqueue:localdev@pgbouncer:6432/ticketqueue?sslmode=disable
+      PGBOUNCER: "true"
+      POOL_MAX_CONNS: "${POOL_MAX_CONNS:-10}"
+      REDIS_ADDR: redis:6379
+      METRICS_PORT: "9091"
+      PAYMENT_URL: http://payment-service:8082
+    ports:
+      - "9091:9091"
+
+  payment-service:
+    profiles: ["app"]
+    image: ticketqueue/payment-service:${IMAGE_TAG:-local}
+    environment:
+      PAYMENT_PORT: "8082"
+      # Overridable so the reconciliation demo can turn it off. With the webhook
+      # on, tok_drops_response resolves before the caller even sees the dropped
+      # connection, and the demo's premise (client gets 504, worker heals it
+      # later) stops holding — see docs/demo.md.
+      WEBHOOK_URL: "${WEBHOOK_URL-http://api:8080/webhooks/payment-service}"
+      WEBHOOK_SECRET: whsec_localdev
+    ports:
+      - "8082:8082"
 
 volumes:
   pgdata:

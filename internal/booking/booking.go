@@ -173,11 +173,15 @@ func HoldTickets(ctx context.Context, pool *pgxpool.Pool, userID string, tier Ti
 	}
 
 	for _, action := range []string{"booking_created", "tickets_held"} {
+		md, err := jsonbParam(map[string]any{"tier_id": tier.ID, "quantity": qty, "total_cents": totalCents})
+		if err != nil {
+			return Held{}, fmt.Errorf("audit %s: %w", action, err)
+		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, metadata, request_id)
-			 VALUES ('booking', $1, $2, 'user', $3, $4, $5)`,
+			 VALUES ('booking', $1, $2, 'user', $3, $4::jsonb, $5)`,
 			bookingID, action, userID,
-			map[string]any{"tier_id": tier.ID, "quantity": qty, "total_cents": totalCents},
+			md,
 			requestID); err != nil {
 			return Held{}, fmt.Errorf("audit %s: %w", action, err)
 		}

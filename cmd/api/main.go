@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,11 +21,20 @@ import (
 	apimw "github.com/vinhpnguyen123/ticketqueue/internal/http/middleware"
 	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 	"github.com/vinhpnguyen123/ticketqueue/internal/redis"
+	"github.com/vinhpnguyen123/ticketqueue/internal/version"
 )
 
 func main() {
+	if probe := flag.String("healthcheck", "", "probe this URL, exit 0 if healthy (used by the container HEALTHCHECK)"); true {
+		flag.Parse()
+		if *probe != "" {
+			os.Exit(version.Healthcheck(*probe))
+		}
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+	logger.Info("api starting", "version", version.SHA)
 
 	cfg, err := config.Load()
 	if err != nil {

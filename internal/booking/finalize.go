@@ -6,6 +6,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 )
 
 // Actor is who caused a state change, for audit_log. Type is one of
@@ -155,6 +157,12 @@ func Finalize(ctx context.Context, pool *pgxpool.Pool, held Held, tierID, userID
 
 // providerResp returns the raw provider body as a jsonb-castable value, or nil
 // for NULL when the provider never answered.
+// jsonbParam is the package's single door to a JSONB column. See db.JSONB for
+// why every one of them must be marshalled here and cast in the SQL.
+func jsonbParam(m map[string]any) (any, error) {
+	return db.JSONB(m)
+}
+
 func providerResp(raw []byte) any {
 	if len(raw) == 0 {
 		return nil
@@ -334,14 +342,13 @@ func audit(ctx context.Context, tx pgx.Tx, bookingID, action string, a Actor, me
 		}
 		metadata["source"] = a.Source
 	}
-	// A nil map must reach Postgres as NULL, not as an empty object.
-	var md any
-	if metadata != nil {
-		md = metadata
+	md, err := jsonbParam(metadata)
+	if err != nil {
+		return fmt.Errorf("audit %s: %w", action, err)
 	}
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, metadata, request_id)
-		 VALUES ('booking', $1, $2, $3, $4, $5, $6)`,
+		 VALUES ('booking', $1, $2, $3, $4, $5::jsonb, $6)`,
 		bookingID, action, a.Type, nullStr(a.UserID), md, nullStr(a.RequestID)); err != nil {
 		return fmt.Errorf("audit %s: %w", action, err)
 	}

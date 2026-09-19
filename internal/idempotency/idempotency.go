@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/auth"
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	"github.com/vinhpnguyen123/ticketqueue/internal/http/response"
 	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
@@ -121,11 +122,20 @@ func Middleware(pool *pgxpool.Pool) func(http.Handler) http.Handler {
 			if rec.buf.Len() > 0 {
 				respBody = rec.buf.Bytes()
 			}
+			// ::jsonb and a JSON string, not raw []byte: under the simple
+			// protocol a []byte encodes as a bytea literal and Postgres
+			// answers "invalid input syntax for type json", which reads like
+			// corrupt data rather than a driver setting. See db.JSONB.
+			bodyParam, encErr := db.JSONB(respBody)
+			if encErr != nil {
+				slog.Error("idempotency response body encode failed", "error", encErr)
+				return
+			}
 			if _, err := pool.Exec(ctx,
 				`UPDATE idempotency_keys
-				 SET response_status = $3, response_body = $4, booking_id = $5, completed_at = NOW()
+				 SET response_status = $3, response_body = $4::jsonb, booking_id = $5, completed_at = NOW()
 				 WHERE key = $1 AND user_id = $2`,
-				key, userID, rec.status, respBody, holder.id); err != nil {
+				key, userID, rec.status, bodyParam, holder.id); err != nil {
 				// Response already went to the client; the row stays uncompleted
 				// and a retry lands on the stale-lock branch (request_unresolved).
 				slog.Error("idempotency outcome persist failed", "key", key, "error", err)

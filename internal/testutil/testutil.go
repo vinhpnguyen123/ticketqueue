@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/redis/go-redis/v9"
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 )
 
 // tables lists every table in the schema, truncated between tests.
@@ -37,13 +39,14 @@ func TestDB(t *testing.T) *pgxpool.Pool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	pool, err := pgxpool.New(ctx, url)
+	// db.NewPool, not pgxpool.New: the suite must build its pool exactly the
+	// way the binaries do, or it cannot catch a configuration that only breaks
+	// in production. Specifically, PGBOUNCER=true switches pgx to simple
+	// protocol; a suite that bypassed that would pass against PgBouncer while
+	// the deployed code failed under concurrency.
+	pool, err := db.NewPool(ctx, url)
 	if err != nil {
-		t.Fatalf("connect to test database: %v", err)
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		t.Fatalf("ping test database (is docker compose up and migrate-test-up applied?): %v", err)
+		t.Fatalf("connect to test database (is docker compose up and migrate-test-up applied?): %v", err)
 	}
 
 	t.Cleanup(func() {

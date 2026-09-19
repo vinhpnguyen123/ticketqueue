@@ -299,7 +299,9 @@ WEEK 6 (load test + chaos) — DONE 2026-09-18. Canonical numbers live in docs/l
 LATER:
 
 Week 6 (as originally written, for the record): k6 load test (10k concurrent @ 100 tickets → exactly 100 sold, 0 oversells, measure P95); capture Grafana panels during the run (latency breakdown, pool saturation, recovery); chaos (kill API mid-load, reconciliation recovers; make provider unreachable, verify no tickets released on a guess). After the run, verify in SQL: sold tickets == confirmed booking quantities == succeeded payment amounts. NOTE: do NOT claim load numbers on resume until this runs.
-Week 7: Dockerfiles, Terraform (VPC/RDS/ElastiCache/ECS/ALB/Secrets), deploy, demo video, tear down (~$15-30). Add PgBouncer (transaction mode; set pgx simple protocol to avoid prepared-statement breakage).
+WEEK 7 (in progress) — DONE so far: Dockerfiles for all three binaries (multi-stage, distroless/static nonroot, git SHA in /health, in-binary -healthcheck because distroless has no shell), .dockerignore, PgBouncer transaction mode + pgx simple protocol behind PGBOUNCER=true, POOL_MAX_CONNS, compose `app` profile running the built images, make docker-build/docker-up/test-pgbouncer. Image sizes: payment-service 21.3MB, worker 30.9MB, api 33MB (target was <25MB for the api and it was MISSED — the Go binary alone is 19.3MiB stripped). NOT done: Terraform, deploy, demo video.
+
+Week 7 (remaining): Terraform (VPC/RDS/ElastiCache/ECS/ALB/Secrets), deploy, demo video, tear down (~$15-30). Add PgBouncer (transaction mode; set pgx simple protocol to avoid prepared-statement breakage).
 Week 8: README (pitch, headline load result, Grafana screenshots, 3 headline diagrams, 13 problems, schema, privacy section, honest production-hardening section incl. §17 documented gaps), interview prep.
 
 ═══════════════════════════════════════════
@@ -442,9 +444,21 @@ GAP: Fraud / anti-scalping → DOCUMENT (deliberately out of scope)
 
 The system implements coarse rate limiting only. It does NOT implement the anti-scalping layer a production ticketing platform needs: device fingerprinting, cross-account velocity checks, CAPTCHA/proof-of-work, ML fraud scoring, stolen-card BIN validation, per-identity purchase limits. In production this is a dedicated service or third party (Stripe Radar, hCaptcha, bot-management vendor) sitting in front of the queue and purchase endpoints. The architecture accommodates it: an abuse-scoring check slots in at queue admission and at purchase submission without touching the concurrency core. Optional cheap primitive if ever wanted: per-user-per-event purchase limit via one guarded COUNT query at purchase time.
 
-GAP: DB connection pool of 10 is the application's ceiling → FIX (Week 7, PgBouncer + re-tune)
+GAP: DB connection pool of 10 is the application's ceiling → WRONG, CORRECTED Week 7
 
-Problem: pgxpool MaxConns=10 saturates at ~1,000 VUs (db_pool_in_use pinned at max; ~one empty-pool wait per request). Every second of the 6.5s p95 at 2,000 VUs is tx1/tx2 waiting for a connection, not SQL and not the provider. Resolution: Week 7 adds PgBouncer in transaction mode and re-runs the calibration; MaxConns must then be tuned against Postgres max_connections rather than left at a placeholder. Interview line: "The bottleneck was a config value, and the metrics said so — db_pool_in_use flat at max while payment_call sat at 5ms."
+What was claimed (rev. 4): MaxConns=10 was the ceiling and raising it would raise throughput. Measured instead (docs/load-test-results.md §7): 2,000 VUs, three passes each, medians 235/s at MaxConns=10 vs 211/s at MaxConns=50 vs 210/s through PgBouncer. Five times the connections buys NOTHING. docker stats during the run: Postgres at 749-788% CPU of the 800% its VM has, host 0.0% idle. The database is the service rate; a full pool is the queue in front of it, not the cause. MaxConns is now settable via POOL_MAX_CONNS so this stays measurable. Interview line: "I thought the pool was the bottleneck because it was pinned at max. Widening it 5x changed nothing — the pool was the queue, Postgres CPU was the wall. The metric that proved it was docker stats, not the app."
+
+GAP: pgx + transaction-mode pooling breaks JSONB parameters → FIXED (Week 7)
+
+Problem, found the moment simple protocol was switched on: pgx encodes a JSONB parameter by asking the server to describe it, which the simple protocol never does. A bare map fails with "unable to encode map[string]interface{} ... unknown type (OID 0)" and a []byte becomes a bytea literal that Postgres rejects as "invalid input syntax for type json". Every audit_log write was affected. Resolution: db.JSONB marshals once, all eight call sites carry an explicit ::jsonb cast, and the behaviour is identical under both protocols so there is no PgBouncer-only path. Note the discovery order: the integration suite passed against PgBouncer BEFORE the fix was switched on, so the suite alone would never have found it.
+
+GAP: the documented pgx/PgBouncer prepared-statement trap no longer fires by itself → DOCUMENT
+
+PgBouncer >= 1.21 tracks prepared statements and re-prepares them on whichever server connection it hands out; 1.25.2 ships with max_prepared_statements=200. Measured: with it at 0, 107 of 4,000 transactions failed with "prepared statement does not exist"; at 200, zero. The app still sets simple protocol under PGBOUNCER=true because this is a property of the pooler in front of the database, and RDS Proxy or an older PgBouncer will not do it. The value is pinned in pgbouncer/pgbouncer.ini rather than inherited from a default that has already changed once.
+
+GAP: the webhook makes the reconciliation demo's premise false → DOCUMENT
+
+With WEBHOOK_URL set (as the container profile does, correctly), tok_drops_response resolves via the webhook before the caller sees the dropped connection, so the purchase returns 201 and not the 504 the demo asserts. Correct behaviour on both sides — it is the sibling-confirmed branch, which has its own test. Documented in docs/demo.md: run the demo with WEBHOOK_URL empty. It also means 90-120s is the BACKSTOP recovery time, not the typical one.
 
 GAP: Reconciliation recovery time scales with backlog → DOCUMENT (tune if it matters)
 
@@ -475,6 +489,9 @@ Restarting cmd/payment-service loses all charges, so reconciliation would see "n
 Added Prometheus + Grafana (§2, §11a, Week 5/6/8 tasks, cut line #2).
 Reconciliation scan changed to plain read (no FOR UPDATE across the provider call).
 Added fraud/anti-scalping gap (document only).
+
+rev. 5 (Week 7, local containerization):
+Three Dockerfiles (build/), PgBouncer in transaction mode, POOL_MAX_CONNS, internal/version + a -healthcheck probe in each binary. Proven locally before AWS: integration suite 3x green through PgBouncer, make demo PASS (110s), 500-VU storm clean, verify_run 9/9. §17: the "pool is the ceiling" gap from rev. 4 is CORRECTED (it is Postgres CPU), and three new gaps recorded. Measurements: docs/load-test-results.md §7-§8.
 
 rev. 4 (end of Week 6):
 Week 6 marked done in §13 with measured numbers inline. Five gaps added to §17 from the load test: pool of 10 as the real ceiling, batch-limited recovery, censored phase histogram, outage lockout UX, environmental ceilings. §10 chaos switch is now built. Canonical results: docs/load-test-results.md.

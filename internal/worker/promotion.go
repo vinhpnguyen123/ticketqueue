@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 	"github.com/vinhpnguyen123/ticketqueue/internal/queue"
 )
@@ -128,8 +129,8 @@ func admitUser(ctx context.Context, pool *pgxpool.Pool, userID, eventID string) 
 
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, metadata)
-		 VALUES ('event', $1, 'queue_admitted', 'worker', $2)`,
-		eventID, map[string]any{"user_id": userID}); err != nil {
+		 VALUES ('event', $1, 'queue_admitted', 'worker', $2::jsonb)`,
+		eventID, userIDMeta(userID)); err != nil {
 		return fmt.Errorf("audit insert: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -170,10 +171,18 @@ func sweepExpired(ctx context.Context, pool *pgxpool.Pool, eventID string, windo
 	for _, userID := range userIDs {
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, metadata)
-			 VALUES ('event', $1, 'queue_window_expired', 'worker', $2)`,
-			eventID, map[string]any{"user_id": userID}); err != nil {
+			 VALUES ('event', $1, 'queue_window_expired', 'worker', $2::jsonb)`,
+			eventID, userIDMeta(userID)); err != nil {
 			return fmt.Errorf("audit expired: %w", err)
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// userIDMeta builds the one metadata shape this worker writes. It swallows the
+// marshal error because a map with one string in it cannot fail to marshal, and
+// an audit row is not worth aborting a promotion cycle over.
+func userIDMeta(userID string) any {
+	md, _ := db.JSONB(map[string]any{"user_id": userID})
+	return md
 }

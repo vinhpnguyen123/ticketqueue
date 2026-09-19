@@ -17,8 +17,8 @@ Everything ran on one laptop, client and server sharing the same cores.
 | Redis | 7.4.9 (`redis:7-alpine`) |
 | Observability | Prometheus 3.1.0 (5s scrape, 15d retention), Grafana 11.5.1 |
 | App | Go 1.26.3; `cmd/api`, `cmd/worker`, `cmd/payment-service` as host processes (not containers) |
-| DB pool | **pgxpool `MaxConns = 10`** (`internal/db/pool.go`) — this matters, see §4 |
-| PgBouncer | **Not present.** Arrives with the Week 7 deploy |
+| DB pool | **pgxpool `MaxConns = 10`** (`internal/db/pool.go`), overridable with `POOL_MAX_CONNS` — see §7 |
+| PgBouncer | Not present for §2–§6. Added and measured in §7; `pgbouncer/pgbouncer.ini`, transaction mode, `default_pool_size=25` |
 | Load generator | k6 v2.2.0 on the same machine |
 | Kernel | `kern.ipc.somaxconn = 128`, `kern.maxfilesperproc = 10240` |
 
@@ -88,7 +88,8 @@ Raw: [`k6-latency-2000vu-2000tickets.txt`](screenshots/k6-latency-2000vu-2000tic
 **The database phases dominate; the payment call is noise.** `tx2` is the
 largest single phase. The provider answered in 5 ms at p95 on its own
 histogram (`charge_duration_seconds`), so none of the 6.5 s is the simulated
-network — it is time spent waiting for a database connection (see §4).
+network — it is time queued in front of a database that is already at 100% CPU
+(see §4 and the pool experiment in §7).
 
 ### Why p95 is measured on completed purchases only
 
@@ -127,14 +128,22 @@ with zero 5xx and zero dropped connections.
 
 ### What saturated first, in order
 
-1. **The database connection pool, at ≤ 1,000 VUs.** `db_pool_in_use` pinned at
-   **10 = `db_pool_max`** in every run from 1,000 VUs up. During the 2,000-VU
-   latency run the API accumulated **14,895 s of `db_pool_acquire_wait_seconds_total`**
-   and **14,984 `db_pool_empty_acquire_total`** in a ~15 s window — roughly one
-   empty-pool wait per request. That wait is where `tx1` and `tx2` spend their
-   time; the SQL itself is fast. This is the application's real ceiling on this
-   machine, and it was set by a configuration value, not by the design.
-2. **The kernel accept queue, at 10,000 VUs.** `kern.ipc.somaxconn = 128`. With
+> **Corrected 2026-09-18 (Week 7).** This section originally said the connection
+> pool was the ceiling and that it "was set by a configuration value, not by the
+> design". That was wrong as a causal claim, and §7 shows the experiment that
+> disproved it: raising `MaxConns` from 10 to 50 does not raise throughput.
+> A full pool in front of a saturated database is a queue, not a cause.
+
+1. **Postgres CPU, from ~1,000 VUs.** During a 2,000-VU run the Postgres
+   container sits at **749–788% CPU out of the 800% its VM has**, with host idle
+   at **0.0%**. The service rate is fixed by how fast the database can execute
+   `tx1` and `tx2`, and no client-side setting moves it.
+2. **The connection pool is where that backpressure becomes visible, not where
+   it originates.** `db_pool_in_use` pins at `db_pool_max` and the API
+   accumulates ~15,000 s of `db_pool_acquire_wait_seconds_total` per 15 s
+   window — about one empty-pool wait per request. Widen the pool and the same
+   waiting happens inside Postgres instead (§7).
+3. **The kernel accept queue, at 10,000 VUs.** `kern.ipc.somaxconn = 128`. With
    the app taking ~15 s per request, the listen backlog overflowed and the
    kernel dropped connections before the process saw them. Proof: k6 sent 10,000
    requests, the API logged exactly **8,351** (100 × 201 + 8,251 × 409), and the
@@ -222,9 +231,11 @@ other working.
   A real provider is 100–500 ms away and would become the dominant phase at low
   concurrency; the pool contention would then be hidden behind it rather than
   absent.
-- **No PgBouncer, pool of 10.** The ceiling in §4 is a `MaxConns` setting.
-  Week 7 adds PgBouncer in transaction mode; the calibration curve must be
-  re-run afterwards and will move.
+- **No PgBouncer, pool of 10** in the Week 6 runs. PgBouncer was added and
+  measured afterwards (§7); it did not move throughput on this machine, because
+  the limit is the database's CPU, not connection handling. On RDS, where the
+  database has its own cores and connections are expensive, the answer may
+  differ — re-run the curve there.
 - **VU count limited by the load generator** at the top end, and by the macOS
   listen backlog at 10,000. Neither is the application.
 - **100-ticket runs have thin latency samples** (100 values). That is why the
@@ -238,6 +249,79 @@ other working.
   5.25 s (morning, fresh DB) to 6.48 s (evening). Both are reported; the
   evening figure is the one above because its raw output is committed.
 - **One day, one operator.** No repeated-day variance measured.
+
+## 7. PgBouncer and pool sizing
+
+Run before the AWS deploy, because the answer changes what is worth paying for.
+Same script, same 2,000 VUs against a 3,000-ticket tier, three passes of each
+configuration; the median is quoted because one pass of (b) produced an outlier
+(109.9/s) that did not reproduce.
+
+| | Config | Throughput (3 passes) | Median | p(95) | `db_pool_in_use` peak | 5xx | prepared-stmt errors |
+|---|---|---|---:|---:|---:|---:|---:|
+| (a) | Direct to Postgres, `MaxConns=10` — the Week 6 baseline | 235.2 / 212.2 / 257.2 | **235.2/s** | 8.25 s | 10 | 0 | 0 |
+| (b) | Direct to Postgres, `MaxConns=50` | 109.9 / 222.6 / 211.0 | **211.0/s** | 8.56 s | 50 | 0 | 0 |
+| (c) | Through PgBouncer, `MaxConns=50`, `default_pool_size=25` | 201.1 / 225.4 / 210.0 | **210.0/s** | 9.20 s | 50 | 0 | 0 |
+
+**(b) does not beat (a).** Five times the connections buys nothing, so the Week 6
+plateau was never pool starvation and the Week 6 number does not understate the
+system. Grafana Row 3 points straight at the reason, and `docker stats`
+confirms it: **Postgres runs at 749–788% CPU out of 800%, with the host at 0.0%
+idle.** The database is the service rate. A wider pool just moves the queue from
+`pgxpool` into Postgres, which is why (b) is, if anything, slightly worse.
+
+**(c) costs about 10% latency and buys nothing here, which is the expected
+result and not an argument against it.** PgBouncer earns its place when
+connections are expensive and numerous — an RDS instance with `max_connections`
+in the low hundreds and several ECS tasks each holding a pool. On one laptop
+with one API process there is nothing for it to multiplex. It is in the stack
+because Week 7 needs it, and because running it locally is how the two
+incompatibilities in §8 were found before they could cost ECS time.
+
+Correction to §4 follows from this: the pool was a symptom, not the cause.
+
+## 8. Two incompatibilities PgBouncer exposed
+
+Both were found locally, in minutes, and both would have been expensive in ECS.
+
+**1. The documented trap — prepared statements — is real but no longer
+automatic.** pgx prepares and caches statements per connection; transaction-mode
+PgBouncer hands a different server connection to each transaction. Reproduced
+deliberately at 200 goroutines × 20 transactions:
+
+| PgBouncer setting | Result |
+|---|---|
+| `max_prepared_statements = 0` | 3,891 ok, **107 `prepared statement ... does not exist`** (2.7%) |
+| `max_prepared_statements = 200` (1.25 default) | 4,000 ok, 0 errors |
+| any, with pgx simple protocol | 4,000 ok, 0 errors |
+
+PgBouncer ≥ 1.21 tracks prepared statements and re-prepares them on whichever
+server connection it hands out, so on 1.25.2 the trap does not fire by itself.
+The value is pinned in `pgbouncer/pgbouncer.ini` rather than inherited, and the
+app still switches to simple protocol under `PGBOUNCER=true`, because this is a
+property of whatever pooler is actually in front of the database — an older
+PgBouncer, or RDS Proxy, will not do it for you.
+
+Note the failure shape: the full integration suite passed against PgBouncer with
+prepared statements enabled and the fix switched off. Only the concurrency
+reproduction showed it. That is exactly the pattern the plan warned about.
+
+**2. The undocumented trap — JSONB parameters — broke everything.** Turning on
+simple protocol turned the suite red across five packages:
+
+```
+unable to encode map[string]interface{}{...} into text format
+for unknown type (OID 0): cannot find encode plan
+invalid input syntax for type json (SQLSTATE 22P02)
+```
+
+Under the extended protocol pgx asks the server to describe each parameter,
+learns the target column is `jsonb`, and picks an encoder. Simple protocol has
+no describe step, so a bare Go map has no target type and a `[]byte` encodes as
+a `bytea` literal. Every `audit_log` write was affected — the audit trail is not
+an optional feature. Fixed in one place (`db.JSONB`) with an explicit `::jsonb`
+cast at all eight call sites, which behaves identically under both protocols, so
+there is no PgBouncer-only code path to keep in sync.
 
 ## Numbers to carry forward
 

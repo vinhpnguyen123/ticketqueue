@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 	"github.com/vinhpnguyen123/ticketqueue/internal/queue"
 )
@@ -313,10 +314,14 @@ func sweepAbandonedQueueEntries(ctx context.Context, rdb *redis.Client, pool *pg
 // lifecycle. actor_type is 'worker' per §9; metadata.source names the job, the
 // same convention the finalize paths use via Actor.Source.
 func auditSystem(ctx context.Context, pool *pgxpool.Pool, entityType, entityID, action string, metadata map[string]any) error {
+	md, err := db.JSONB(metadata)
+	if err != nil {
+		return fmt.Errorf("audit %s: %w", action, err)
+	}
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, metadata)
-		 VALUES ($1, $2, $3, 'worker', $4)`,
-		entityType, entityID, action, metadata); err != nil {
+		 VALUES ($1, $2, $3, 'worker', $4::jsonb)`,
+		entityType, entityID, action, md); err != nil {
 		return fmt.Errorf("audit %s: %w", action, err)
 	}
 	return nil

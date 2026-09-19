@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,12 +18,21 @@ import (
 	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 	"github.com/vinhpnguyen123/ticketqueue/internal/redis"
+	"github.com/vinhpnguyen123/ticketqueue/internal/version"
 	"github.com/vinhpnguyen123/ticketqueue/internal/worker"
 )
 
 func main() {
+	if probe := flag.String("healthcheck", "", "probe this URL, exit 0 if healthy (used by the container HEALTHCHECK)"); true {
+		flag.Parse()
+		if *probe != "" {
+			os.Exit(version.Healthcheck(*probe))
+		}
+	}
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+	logger.Info("worker starting", "version", version.SHA)
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -104,9 +115,22 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-// metricsMux serves only /metrics, on the worker's own port.
+// metricsMux serves /metrics and /health on the worker's own port.
+//
+// The worker had no HTTP health endpoint: it is not a server, so nothing ever
+// needed one. A container does. Both Docker's HEALTHCHECK and an ECS health
+// check need something to ask, and "the metrics port answers" is a genuine
+// liveness signal for this process — the scrape handler runs on the same
+// goroutine pool as everything else, so if it answers, the process is alive.
 func metricsMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metrics.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":  "ok",
+			"version": version.SHA,
+		})
+	})
 	return mux
 }

@@ -4,12 +4,14 @@
 package main
 
 import (
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 	"github.com/vinhpnguyen123/ticketqueue/internal/paymentsim"
+	"github.com/vinhpnguyen123/ticketqueue/internal/version"
 )
 
 func envOr(key, def string) string {
@@ -20,7 +22,15 @@ func envOr(key, def string) string {
 }
 
 func main() {
+	if probe := flag.String("healthcheck", "", "probe this URL, exit 0 if healthy (used by the container HEALTHCHECK)"); true {
+		flag.Parse()
+		if *probe != "" {
+			os.Exit(version.Healthcheck(*probe))
+		}
+	}
+
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	slog.Info("payment-service starting", "version", version.SHA)
 	port := envOr("PAYMENT_PORT", "8081")
 	apiKey := envOr("PAYMENT_API_KEY", "ps_test_localdev")
 

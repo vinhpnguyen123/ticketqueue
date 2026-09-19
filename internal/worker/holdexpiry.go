@@ -12,6 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/booking"
+	"github.com/vinhpnguyen123/ticketqueue/internal/db"
 	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
 )
 
@@ -141,10 +142,17 @@ func recordDeferral(ctx context.Context, pool *pgxpool.Pool, bookingID string) e
 
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, metadata)
-		 VALUES ('booking', $1, $2, 'worker', $3)`,
+		 VALUES ('booking', $1, $2, 'worker', $3::jsonb)`,
 		bookingID, deferredAuditAction,
-		map[string]any{"source": "hold_expiry", "reason": "provider_unreachable"}); err != nil {
+		deferralMeta()); err != nil {
 		return fmt.Errorf("audit %s: %w", deferredAuditAction, err)
 	}
 	return nil
+}
+
+// deferralMeta is the fixed metadata on a deferral row. Constant input, so the
+// marshal cannot fail.
+func deferralMeta() any {
+	md, _ := db.JSONB(map[string]any{"source": "hold_expiry", "reason": "provider_unreachable"})
+	return md
 }

@@ -73,3 +73,27 @@ SQL.
 
 **429 on back-to-back runs:** register is rate-limited to 3 per window per IP.
 Wait for the window to reset, or run against a fresh Redis (`docker compose restart redis`).
+
+
+## Running this against the containers
+
+`make docker-up` runs the built images through PgBouncer. The demo passes there
+(measured: recovered in 110s), with one caveat worth knowing.
+
+**The webhook must be off for this demo to demonstrate what it claims.** The
+compose app profile wires `WEBHOOK_URL` by default, which is correct for a
+deployment. With it on, `tok_drops_response` behaves differently from the story
+above: the provider hijacks the connection and fires the webhook immediately, so
+the webhook resolves the booking *before* the caller has even noticed the dropped
+connection. TX2 then finds the booking already confirmed and returns **201**, not
+504 — the sibling-confirmed branch, which is correct behaviour and has its own
+test. The demo asserts the 504, so run it with the webhook disabled:
+
+```bash
+WEBHOOK_URL= docker compose --profile app up -d payment-service
+make demo
+```
+
+This is not a bug in either path. It is the webhook doing exactly what it was
+built for (§14 #1: a latency optimisation on the dropped-response path), and it
+means the 90-120s worker recovery is the *backstop* timing, not the typical one.

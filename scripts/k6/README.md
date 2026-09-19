@@ -144,11 +144,12 @@ buy queue time and nothing else — p(95) tracks Little's law almost exactly (2,
 was 100 tickets, so most of what did arrive was a fast-path rejection. It is not comparable
 to the rows above it.)
 
-**What saturated first: the connection pool, then the kernel — never the app.**
-`pgxpool MaxConns = 10`, and `db_pool_in_use` sits pinned at 10 from 1,000 VUs upward
-while `payment_call` stays at 5 ms; the 2,000-VU run accumulated ~15,000 s of
-`db_pool_acquire_wait_seconds_total`. That is the application's ceiling here, and it is a
-configuration value. Second, at 10,000 VUs, `kern.ipc.somaxconn` is **128** on macOS: with
+**What saturated first: Postgres CPU, then the kernel — never the app code.**
+During a 2,000-VU run the Postgres container sits at 749-788% CPU out of the 800% its VM
+has, with the host at 0.0% idle. `db_pool_in_use` pins at `db_pool_max` and the API piles
+up ~15,000 s of `db_pool_acquire_wait_seconds_total`, but that is the queue in FRONT of the
+saturated database, not the cause: raising `MaxConns` from 10 to 50 does not raise
+throughput (235/s vs 211/s median of three, `docs/load-test-results.md` §7). Second, at 10,000 VUs, `kern.ipc.somaxconn` is **128** on macOS: with
 an app taking ~15 s per request the accept queue overflows and the kernel drops connections
 before the process sees them. Proof: k6 sent 10,000 requests, the API logged exactly
 **8,351** (100 x 201 + 8,251 x 409) — and the 1,649 missing ones equal k6's connection-error

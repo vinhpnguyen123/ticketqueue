@@ -7,7 +7,7 @@ PORT ?= 8081
 PAYMENT_PORT ?= 8082
 PAYMENT_URL ?= http://localhost:8082
 
-.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo load-seed load-storm load-journey load-calibrate verify-run sabotage chaos-1 chaos-2 chaos-3 chaos-all
+.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo load-seed load-storm load-journey load-calibrate verify-run sabotage chaos-1 chaos-2 chaos-3 chaos-all docker-build docker-up docker-down test-pgbouncer
 
 up:
 	docker compose up -d
@@ -103,3 +103,36 @@ chaos-3:
 	bash scripts/chaos/chaos3_worker_kill.sh
 
 chaos-all: chaos-1 chaos-2 chaos-3
+
+# ---- Containers -------------------------------------------------------------
+# GIT_SHA is baked into each binary and returned by /health. An image tag can be
+# re-pushed under the same name; the commit in the binary cannot.
+GIT_SHA ?= $(shell git rev-parse --short HEAD)
+IMAGE_TAG ?= local
+
+docker-build:
+	@for b in api worker payment-service; do \
+		echo "building $$b"; \
+		docker build -q -f build/$$b.Dockerfile --build-arg GIT_SHA=$(GIT_SHA) \
+			-t ticketqueue/$$b:$(IMAGE_TAG) . >/dev/null || exit 1; \
+	done
+	@echo; docker images --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep '^ticketqueue/'
+
+# Runs the BUILT IMAGES rather than `go run`, through PgBouncer, so what is
+# tested is what gets deployed. Everything else (postgres, redis, prometheus,
+# grafana, pgbouncer) comes up as usual.
+docker-up: docker-build
+	docker compose --profile app up -d
+	@echo "api      http://localhost:$(PORT)/v1/health"
+	@echo "payments http://localhost:$(PAYMENT_PORT)/health"
+
+# `--profile app down` would take the whole project with it — postgres, redis,
+# prometheus, the lot — because `down` is project-scoped, not profile-scoped.
+# Stop and remove only the three app containers.
+docker-down:
+	docker compose rm -sf api worker payment-service
+
+# Integration suite through PgBouncer, i.e. against the deployed topology.
+test-pgbouncer:
+	TEST_DATABASE_URL="postgres://ticketqueue:localdev@localhost:6432/ticketqueue_test?sslmode=disable" \
+	PGBOUNCER=true go test -tags=integration -p 1 -count=1 ./...

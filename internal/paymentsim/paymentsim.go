@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/metrics"
+	"github.com/vinhpnguyen123/ticketqueue/internal/version"
 )
 
 // Vars so tests can shrink the delays instead of sleeping 35s.
@@ -83,7 +84,7 @@ func NewServer(apiKey string, opts ...Option) http.Handler {
 	}
 	r := chi.NewRouter()
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version.SHA})
 	})
 	// VPC-only in a real deploy: never expose /metrics publicly.
 	r.Handle("/metrics", metrics.Handler())
