@@ -172,19 +172,25 @@ func HoldTickets(ctx context.Context, pool *pgxpool.Pool, userID string, tier Ti
 		return Held{}, fmt.Errorf("layer-3 guard: assigned %d of %d tickets", tag.RowsAffected(), qty)
 	}
 
-	for _, action := range []string{"booking_created", "tickets_held"} {
-		md, err := jsonbParam(map[string]any{"tier_id": tier.ID, "quantity": qty, "total_cents": totalCents})
-		if err != nil {
-			return Held{}, fmt.Errorf("audit %s: %w", action, err)
-		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, metadata, request_id)
-			 VALUES ('booking', $1, $2, 'user', $3, $4::jsonb, $5)`,
-			bookingID, action, userID,
-			md,
-			requestID); err != nil {
-			return Held{}, fmt.Errorf("audit %s: %w", action, err)
-		}
+	// ONE row, not two. This used to write 'booking_created' and 'tickets_held'
+	// as separate rows, in this same transaction, at the same timestamp, with
+	// the identical metadata map — 135,508 of each, 14 MB of metadata twice for
+	// the same content. Neither can occur without the other: TX1 either creates
+	// the booking and holds its tickets, or it rolls back. Two names for one
+	// atomic event carried no information the trail did not already have.
+	//
+	// tier_id is gone from the metadata too: booking.ticket_tier_id already
+	// holds it, and an audit row does not need to restate a column of the row
+	// it describes.
+	md, err := jsonbParam(map[string]any{"quantity": qty, "total_cents": totalCents})
+	if err != nil {
+		return Held{}, fmt.Errorf("audit booking_created: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, metadata, request_id)
+		 VALUES ('booking', $1, 'booking_created', 'user', $2, $3::jsonb, $4)`,
+		bookingID, userID, md, requestID); err != nil {
+		return Held{}, fmt.Errorf("audit booking_created: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

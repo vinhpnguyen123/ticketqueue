@@ -333,7 +333,6 @@ func TestAdminAuditTimeline(t *testing.T) {
 	}
 	want := []string{
 		"booking_created:user",
-		"tickets_held:user",
 		"booking_confirmed:admin",
 		"payment_succeeded:admin",
 	}

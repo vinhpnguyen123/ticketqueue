@@ -224,10 +224,12 @@ func TestPurchaseConfirmed(t *testing.T) {
 	var audits int
 	pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM audit_log WHERE entity_id = $1
-		 AND action IN ('booking_created','tickets_held','booking_confirmed','payment_succeeded')`,
+		 AND action IN ('booking_created','booking_confirmed','payment_succeeded')`,
 		bookingID).Scan(&audits)
-	if audits != 4 {
-		t.Errorf("audit rows = %d, want 4", audits)
+	// Three, not four: booking_created and tickets_held were merged, because
+	// TX1 cannot produce one without the other.
+	if audits != 3 {
+		t.Errorf("audit rows = %d, want 3", audits)
 	}
 }
 

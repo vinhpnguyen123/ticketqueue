@@ -1,0 +1,18 @@
+-- idx_audit_actor is maintained on every audit_log insert and serves no query.
+--
+-- Evidence, in this order, because scan counts alone are not evidence:
+--   1. grep: no query anywhere filters on actor_user_id. The admin audit API
+--      RETURNS the column (internal/http/admin.go) but never appears in a WHERE.
+--   2. pg_stat_user_indexes: idx_scan = 0 across the whole project's history.
+--   3. Size: 20 MB on a 469k-row table.
+--
+-- CONTRAST, and the reason step 1 is not optional: idx_audit_request ALSO reads
+-- idx_scan = 0, and it is NOT dead. internal/http/admin.go has
+-- `WHERE request_id = $1`; it reads zero only because the load tests never call
+-- that endpoint. It stays. Never drop an index on a scan count alone — grep the
+-- code first.
+--
+-- If a "what did this admin do" query is ever added, recreate it:
+--   CREATE INDEX idx_audit_actor ON audit_log(actor_user_id, created_at)
+--     WHERE actor_user_id IS NOT NULL;
+DROP INDEX idx_audit_actor;

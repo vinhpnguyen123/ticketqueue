@@ -112,9 +112,10 @@ func TestDemoDroppedResponseSelfHeals(t *testing.T) {
 		`SELECT COUNT(*) FROM payments WHERE booking_id = $1 AND status = 'unknown'`, held.BookingID)
 
 	// The trail: every state change, in order, with who caused it.
+	// booking_created covers the tickets being held too: TX1 is atomic, so they
+	// were always one event written under two names.
 	wantTimeline := []string{
 		"booking_created:user",
-		"tickets_held:user",
 		"payment_outcome_unknown:system",
 		"booking_confirmed:worker",
 		"payment_succeeded:worker",

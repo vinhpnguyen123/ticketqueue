@@ -24,7 +24,7 @@ Concretely, it asserts:
 | Booking flips to `confirmed` on its own | The reconciliation worker asked and acted |
 | Exactly `quantity` tickets are `sold` | No partial fulfilment |
 | Exactly **one** `succeeded` payment row | Charged once, never twice |
-| Audit timeline reads `booking_created → tickets_held → payment_outcome_unknown → booking_confirmed + payment_succeeded` | Every state change is attributable, with the last two by `actor_type = 'worker'` |
+| Audit timeline reads `booking_created → payment_outcome_unknown → booking_confirmed + payment_succeeded` | Every state change is attributable, with the last two by `actor_type = 'worker'` |
 
 ## Recovery time
 

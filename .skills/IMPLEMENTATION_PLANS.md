@@ -83,6 +83,8 @@ audit actor_type: user, worker, admin, system
 
 Audit action names used for cross-cutting flags (keep consistent):
 
+booking_created — TX1 succeeded: the booking exists AND its tickets are held. MERGED 2026-09-19: this used to be two rows, 'booking_created' and 'tickets_held', written in the same transaction at the same timestamp with the identical metadata. TX1 is atomic — it cannot create a booking without holding tickets — so the second name carried no information and cost 135,508 duplicate rows plus 14 MB of duplicated metadata. Its metadata no longer carries tier_id either: booking.ticket_tier_id already holds it, and an audit row should not restate a column of the row it describes. Metadata is now {quantity, total_cents}.
+
 reconciliation_needed — money moved but booking could not be confirmed (Outcome D). Surfaced in the admin stuck-bookings view.
 expiry_deferred_provider_unreachable — hold deadline passed but no provider verdict (logged once per booking, not per cycle).
 inventory_drift_corrected — drift checker rewrote a Redis inventory key.
@@ -291,7 +293,7 @@ WEEK 6 (load test + chaos) — DONE 2026-09-18. Canonical numbers live in docs/l
 - Latency (2,000-ticket tier, 2,000 VUs, 2,000 samples): purchase_completed_duration p50 6.26s / p95 6.48s / p99 6.52s, 289 purchases/s. Phase breakdown: tx1 42%, tx2 58%, payment_call 0.01% (5ms p95). Time is spent waiting for a DB connection, not on the provider. At 500 VUs: p95 815ms, every k6 threshold green.
 - Ceiling: throughput plateaus at ~350 purchases/s from 500 VUs. Clean (0 errors) to 8,000 VUs with p95 36s; at 10,000 the kernel (somaxconn=128) dropped 16.5% of connections and the app STILL sold exactly 100/100. What saturated first: pgxpool MaxConns=10 (db_pool_in_use pinned at 10 from 1,000 VUs; 14,895s cumulative acquire wait in the 2,000-VU run). Second: the macOS listen backlog. The app never produced a 5xx.
 - CHAOS 1 (API SIGKILL mid-load): 270 stranded, all resolved 271s after the kill — batch-limited at ReconcileBatch=50/30s ≈ 100 bookings/min; a single booking is still 90–120s. 9/9.
-- CHAOS 2 (provider unreachable 90s, §10 chaos switch now built): 500 bookings frozen, available count NEVER rose, 59 deferral audit rows on 59 bookings (one each across ~18 cycles), all resolved 37s after recovery. 9/9. The strongest correctness evidence in the project.
+aos switch now built): 500 bookings frozen, available count NEVER rose, 59 deferral audit rows on 59 bookings (one each across ~18 cycles), all resolved 37s after recovery. 9/9. The strongest correctness evidence in the project.
 - CHAOS 3 (worker SIGKILL 60s, 10% tok_drops_response): peak 347 unresolved, API kept confirming throughout, 80 left over drained 93s after restart. 9/9. Finding: the webhook resolves dropped-response bookings without the worker; the worker is the backstop.
 - Harness: SharedArray fix (per-VU JSON.parse of the seed was 9.3MB/VU and crashed the 8GB host at 2,000 VUs), RUN_ID unique per run (a constant collided with the previous run's idempotency keys → 422s), checkPurchase now recognises conflict/validation_failed and thresholds them to zero.
 - NOT done: Grafana screenshots (links with pinned windows in docs/screenshots/README.md). calibrate.js is dead code — a ramp prints one aggregate summary and cannot separate 2k from 8k; the ceiling table came from fixed-VU steps.
@@ -337,6 +339,20 @@ Delegate freely: skeleton, config, Dockerfiles, boilerplate, metric wiring, dash
 16. UNDER-THE-HOOD EXPLANATIONS (my own notes — the "why", for interviews)
 
 ═══════════════════════════════════════════ These are my own words explaining how each mechanism actually works. Kept as the reasoning layer behind the spec above. If I can't re-explain these from memory, I don't understand my own project yet.
+
+READING EXPLAIN: "Index Scan" is not the answer, it is the start of the question. The claim
+query used its index and still took 471ms, because ORDER BY id had no sortable key in it and
+the planner fetched every available row of the tier to sort them and return one. The tell was
+not the access method, it was `Sort` sitting above the scan and `Buffers: shared hit=39,630`
+for a single row. Later the planner switched to tickets_pkey — a different plan, still 41,667
+buffers, still wrong. Read the buffer counts and look for a Sort node; two bad plans that both
+say "Index Scan" look fine if you only read the access method.
+
+The same session produced the reverse lesson about indexes that look dead. idx_audit_actor and
+idx_audit_request both showed idx_scan = 0. One was genuinely unused and got dropped; the other
+is used by an admin endpoint the load tests never call. The scan counter measures what the
+workload exercised, not what the code needs. Grep before dropping.
+
 
 Controlling how many people enter a purchase window, and for how long
 
@@ -405,6 +421,12 @@ response_body — replay the exact first answer. When the client retries, it exp
 locked_at — handle two duplicate requests arriving AT THE SAME TIME. The hardest case. The user double-clicks Pay, or the browser resends almost simultaneously — BEFORE the first finishes creating the booking. If relying only on a booking UNIQUE constraint: both rush to create a booking, one wins, the loser hits a UNIQUE error — then the loser has to read the winner, which may not have committed yet. Very messy. The separate table with locked_at: the first request plants a flag, the second sees it and yields. It ORDERS the two concurrent requests cleanly, up front. (booking.version does a different job — preventing lost updates — it does NOT solve this create-race.)
 expires_at — allow key reuse. Idempotency keys usually expire (Stripe ~24h). If the key were bound to the booking row, it would live as long as the booking — essentially forever, and the key space would never be cleaned up. The separate table's expires_at manages key lifecycle independently.
 Audit log
+
+INDEX NOTES (updated 2026-09-19 after profiling with pg_stat_statements + EXPLAIN):
+- tickets: idx_tickets_claim_ordered(ticket_tier_id, id) WHERE status='available' — REPLACED idx_tickets_claim(ticket_tier_id, status). 'status' in a partial index that already filters on status is dead weight, and without id in the key the claim query's ORDER BY id had nothing to seek on: 48ms/41,667 buffers became 0.07ms/5 buffers. Costs 6.6x index size because a unique id defeats B-tree deduplication.
+- audit_log: idx_audit_recon_needed(entity_id) WHERE action='reconciliation_needed' — ADDED. 8 KB. Lets the stuck-bookings gauge start from audit_log instead of seq-scanning booking for `status <> 'confirmed'`, which is not indexable. 11,452 buffers -> 32.
+- audit_log: idx_audit_actor — DROPPED. grep confirmed nothing filters on actor_user_id. Recreate it if a "what did this admin do" query is ever added.
+- audit_log: idx_audit_request — KEPT despite idx_scan=0. admin.go has WHERE request_id=$1; it reads zero because load tests never call that endpoint. Scan count alone is not evidence that an index is dead — grep first.
 
 AUDIT_LOG — append-only history, no foreign keys on purpose so it outlives deleted entities. Every state change writes who/what/when/before/after plus request_id. Role: auditability and dispute resolution (Problem 11) — one indexed query by entity_id answers "everything that happened to this booking" weeks later.
 
@@ -475,6 +497,10 @@ Problem: the one-held-booking-per-user guard means that while the provider is un
 GAP: single-host benchmark ceilings are environmental → DOCUMENT
 
 kern.ipc.somaxconn=128 dropped 16.5% of connections at 10,000 VUs; k6 shared the server's cores above ~4,000 VUs. Neither is the application. Quote 8,000 as the clean ceiling only with "single laptop" attached, and re-measure from a separate load generator after the Week 7 deploy.
+
+GAP: audit_log write volume → DOCUMENT
+
+Audit writes were 24.5% of database exec time, at ~10 indexed writes per purchase. Trimming recovered part of it: one dropped index that served no query, one merged action that was writing the same event twice, and tier_id removed from metadata. The rest is inherent to writing a full audit trail synchronously inside the purchase transaction — it is the feature, not a defect. Production would use an outbox: insert one cheap row into audit_outbox inside the transaction and let a worker expand it into the indexed audit_log asynchronously. NOT built — it adds a table, a worker, and new failure modes (the outbox draining behind, or being replayed twice) for a cost that has not yet capped throughput at this scale. Revisit if audit ever becomes the top entry in pg_stat_statements.
 
 GAP: Simulated provider is in-memory → DOCUMENT
 
