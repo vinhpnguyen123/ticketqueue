@@ -1,0 +1,26 @@
+-- The admin_stuck_bookings_current{category="charged_not_delivered"} gauge runs
+-- every 5 seconds (worker.GaugeInterval) and was doing a Parallel Seq Scan over
+-- every booking row to check against a set that is almost always empty:
+--
+--   reconciliation_needed audit rows : 0
+--   bookings not confirmed           : 1,393 of 135,508
+--
+-- The cause is `b.status <> 'confirmed'` in predicateChargedNotDelivered. A
+-- B-tree cannot seek "not equal", so no index on status would help, and adding
+-- one would be maintained on every booking write for nothing.
+--
+-- The fix is to change which table the planner starts from. `reconciliation_needed`
+-- means money moved but the booking could not be confirmed (Outcome D) — an
+-- exceptional event, so this index is nearly empty by construction. Given it,
+-- the planner drives the EXISTS from audit_log, finds nothing, and never touches
+-- booking at all (booking_pkey shows as "never executed").
+--
+--   charged_not_delivered branch  11,418 buffers -> 1 buffer
+--   whole gauge query             11,452 buffers -> 32 buffers
+--
+-- No Go change: the SQL is untouched and the planner picks this on its own.
+--
+-- Write cost is close to zero even though audit_log is the heaviest-written
+-- table here, because the partial predicate rejects well over 99.99% of inserts
+-- before any index entry is made.
+CREATE INDEX idx_audit_recon_needed ON audit_log(entity_id) WHERE action = 'reconciliation_needed';
