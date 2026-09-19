@@ -1,0 +1,35 @@
+-- The claim query in TX1 is
+--   SELECT id FROM tickets WHERE ticket_tier_id=$1 AND status='available'
+--   ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED
+-- and idx_tickets_claim(ticket_tier_id, status) could not serve it.
+--
+-- Two problems with the old shape. `status` in the key is dead weight: the
+-- partial predicate already restricts the index to available rows, so every
+-- entry carries the identical value. And nothing in the key matches ORDER BY
+-- id, so the planner had only bad options and flipped between them depending
+-- on statistics:
+--
+--   Index Scan on idx_tickets_claim + Sort   471ms / 39,630 buffers
+--   Index Scan on tickets_pkey (filter)       48ms / 41,667 buffers
+--
+-- Both read a large fraction of the tier to return one row. With id in the
+-- key the index supplies the ordering and LIMIT stops at the first entry:
+-- 0.4ms / 5 buffers.
+--
+-- THE COST, stated rather than hidden: this index is ~6.6x larger (1,848 kB ->
+-- 12 MB for 258k available tickets). The old key repeated (tier_id,
+-- 'available') for every row in a tier, which B-tree deduplication compressed
+-- into posting lists. A unique id per entry defeats deduplication entirely.
+-- That is the trade being made: index size for a 100x cheaper hot path.
+--
+-- Created before the old one is dropped, deliberately. A DROP-then-CREATE under
+-- the same name leaves a window with no index at all, and in that window the
+-- claim query falls back to a sequential scan of the whole tickets table. The
+-- name is not referenced anywhere in the code, so changing it costs nothing.
+--
+-- Production note: add CONCURRENTLY to both statements and run them as separate
+-- migrations. CREATE INDEX CONCURRENTLY cannot run inside a transaction, and
+-- golang-migrate wraps each migration in one.
+CREATE INDEX idx_tickets_claim_ordered ON tickets(ticket_tier_id, id) WHERE status = 'available';
+
+DROP INDEX idx_tickets_claim;
