@@ -7,7 +7,7 @@ PORT ?= 8081
 PAYMENT_PORT ?= 8082
 PAYMENT_URL ?= http://localhost:8082
 
-.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo load-seed load-storm load-journey load-calibrate verify-run sabotage chaos-1 chaos-2 chaos-3 chaos-all docker-build docker-up docker-down test-pgbouncer
+.PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo load-seed load-storm load-journey load-calibrate verify-run sabotage chaos-1 chaos-2 chaos-3 chaos-all docker-build docker-up docker-down test-pgbouncer docker-push tf-init tf-plan tf-apply tf-migrate tf-seed tf-destroy tf-cost
 
 up:
 	docker compose up -d
@@ -111,7 +111,7 @@ GIT_SHA ?= $(shell git rev-parse --short HEAD)
 IMAGE_TAG ?= local
 
 docker-build:
-	@for b in api worker payment-service; do \
+	@for b in api worker payment-service migrate; do \
 		echo "building $$b"; \
 		docker build -q -f build/$$b.Dockerfile --build-arg GIT_SHA=$(GIT_SHA) \
 			-t ticketqueue/$$b:$(IMAGE_TAG) . >/dev/null || exit 1; \
@@ -136,3 +136,64 @@ docker-down:
 test-pgbouncer:
 	TEST_DATABASE_URL="postgres://ticketqueue:localdev@localhost:6432/ticketqueue_test?sslmode=disable" \
 	PGBOUNCER=true go test -tags=integration -p 1 -count=1 ./...
+
+# ---- AWS ---------------------------------------------------------------------
+# Terraform lives in terraform/ with LOCAL state. Read terraform/README.md
+# before the first apply — the destroy checklist is at the top of it on purpose.
+TF      := terraform -chdir=terraform
+REGION  ?= us-east-1
+CLUSTER ?= ticketqueue
+
+tf-init:
+	$(TF) init
+
+tf-plan:
+	$(TF) plan -var image_tag=$(GIT_SHA)
+
+tf-apply:
+	$(TF) apply -var image_tag=$(GIT_SHA)
+
+# Build for ARM64 and push to ECR. The images must exist before `tf-apply`
+# creates services that pull them, and the tag is the git SHA so /v1/health can
+# be matched against a commit.
+docker-push: docker-build
+	@set -e; \
+	acct=$$(aws sts get-caller-identity --query Account --output text); \
+	reg=$$acct.dkr.ecr.$(REGION).amazonaws.com; \
+	aws ecr get-login-password --region $(REGION) | docker login --username AWS --password-stdin $$reg; \
+	for b in api worker payment-service migrate; do \
+		docker tag ticketqueue/$$b:$(IMAGE_TAG) $$reg/ticketqueue/$$b:$(GIT_SHA); \
+		docker push $$reg/ticketqueue/$$b:$(GIT_SHA); \
+	done; \
+	echo; echo "pushed at tag $(GIT_SHA)"
+
+# Schema, as a one-shot task. Never from API startup: two API tasks booting at
+# once would race on the migration table.
+tf-migrate:
+	@set -e; \
+	aws ecs run-task --cluster $(CLUSTER) --launch-type FARGATE \
+	  --task-definition ticketqueue-migrate \
+	  --network-configuration "awsvpcConfiguration={subnets=[$$(aws ec2 describe-subnets --region $(REGION) --filters Name=tag:Project,Values=ticketqueue --query 'Subnets[0].SubnetId' --output text)],securityGroups=[$$(aws ec2 describe-security-groups --region $(REGION) --filters Name=group-name,Values=ticketqueue-migrate --query 'SecurityGroups[0].GroupId' --output text)],assignPublicIp=ENABLED}" \
+	  --region $(REGION) --query 'tasks[0].taskArn' --output text
+	@echo "watch it with: aws logs tail /ecs/ticketqueue/migrate --follow --region $(REGION)"
+
+tf-seed:
+	@echo "Seeding runs from the load generator, which is inside the VPC."
+	@echo "RDS is not publicly accessible, so there is nowhere else to run it from."
+	@echo "  make tf-loadgen-sync && ssh ec2-user@<loadgen-ip> './loadseed -tickets=... -users=...'"
+
+# Prints what is still billing. Run it after destroy, every time.
+tf-cost:
+	@aws resourcegroupstaggingapi get-resources \
+	  --tag-filters Key=Project,Values=ticketqueue --region $(REGION) \
+	  --query 'ResourceTagMappingList[].ResourceARN' --output table
+
+tf-destroy:
+	@echo "This destroys the ENTIRE ticketqueue AWS stack: RDS (no final snapshot),"
+	@echo "ElastiCache, ECS services, ALB, secrets, and the load generator."
+	@printf 'Type the word destroy to continue: '; read ans; [ "$$ans" = destroy ] || { echo aborted; exit 1; }
+	$(TF) destroy
+	@echo
+	@echo "=== Anything listed below is STILL RUNNING and still billing ==="
+	@$(MAKE) tf-cost
+	@echo "=== An empty table above is what you want. ==="
