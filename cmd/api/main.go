@@ -90,7 +90,11 @@ func main() {
 	// system and its credential is the HMAC signature.
 	api.NewWebhookHandler(pool, rdb, cfg.WebhookSecret, payments).Mount(r)
 
-	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           api.LimitBody(r),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	go func() {
 		logger.Info("api server listening", "addr", srv.Addr)

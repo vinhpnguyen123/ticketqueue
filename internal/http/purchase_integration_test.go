@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -54,7 +55,7 @@ func newPurchaseServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Cl
 	r.Use(middleware.RequestID)
 	api.NewAuthHandler(pool, rdb, testSecret, 0).Mount(r)
 	api.NewPurchaseHandler(pool, rdb, testSecret, pc).Mount(r)
-	ts := httptest.NewServer(r)
+	ts := httptest.NewServer(api.LimitBody(r))
 	t.Cleanup(ts.Close)
 	return ts, pool, rdb
 }
@@ -949,5 +950,39 @@ func TestPurchaseRejectsTotalOverflow(t *testing.T) {
 	}
 	if n, _ := rdb.Exists(ctx, booking.InventoryKey(tierID)).Result(); n != 0 {
 		t.Errorf("inventory was touched before the overflow check")
+	}
+}
+
+func TestOversizedBodyRejected(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	ctx := context.Background()
+	eventID, _ := seedTier(t, pool, 1000, 5)
+	userID, jwtTok, _ := admittedUser(t, pool, eventID, 1)
+	huge := `{"email":"` + strings.Repeat("a", api.MaxBodyBytes+1) + `","password":"supersecret1"}`
+
+	for _, path := range []string{"/v1/auth/register", "/v1/auth/login", "/v1/purchases"} {
+		t.Run(path, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(huge))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+jwtTok)
+			req.Header.Set("Idempotency-Key", "huge-key")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Errorf("status = %d, want 413", resp.StatusCode)
+			}
+		})
+	}
+
+	// Rejected before the claim, so the key is not burned for a real retry.
+	var claims int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM idempotency_keys WHERE user_id = $1`, userID).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 0 {
+		t.Errorf("idempotency claims = %d, want 0", claims)
 	}
 }

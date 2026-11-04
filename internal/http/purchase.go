@@ -82,6 +82,9 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	var req purchaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if response.BodyTooLarge(w, r, err) {
+			return
+		}
 		response.Error(w, r, http.StatusUnprocessableEntity, "validation_failed", "malformed JSON body")
 		return
 	}

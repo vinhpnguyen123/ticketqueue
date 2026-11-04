@@ -100,6 +100,9 @@ func validateCredentials(req credentialsRequest) map[string]any {
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	var req credentialsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if response.BodyTooLarge(w, r, err) {
+			return
+		}
 		response.Error(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
 		return
 	}
@@ -143,6 +146,9 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	var req credentialsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if response.BodyTooLarge(w, r, err) {
+			return
+		}
 		response.Error(w, r, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
 		return
 	}

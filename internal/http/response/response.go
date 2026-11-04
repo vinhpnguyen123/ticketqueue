@@ -5,6 +5,7 @@ package response
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -71,6 +72,17 @@ func ErrorWithDetails(w http.ResponseWriter, r *http.Request, status int, errTyp
 		RequestID: middleware.GetReqID(r.Context()),
 		Details:   details,
 	}})
+}
+
+// BodyTooLarge answers 413 and returns true when err came from reading past the
+// server's request size limit.
+func BodyTooLarge(w http.ResponseWriter, r *http.Request, err error) bool {
+	var tooLarge *http.MaxBytesError
+	if !errors.As(err, &tooLarge) {
+		return false
+	}
+	Error(w, r, http.StatusRequestEntityTooLarge, "request_too_large", "request body is too large")
+	return true
 }
 
 func write(w http.ResponseWriter, r *http.Request, status int, body any) {

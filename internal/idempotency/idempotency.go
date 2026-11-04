@@ -84,6 +84,9 @@ func Middleware(pool *pgxpool.Pool) func(http.Handler) http.Handler {
 
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
+				if response.BodyTooLarge(w, r, err) {
+					return
+				}
 				response.Error(w, r, http.StatusBadRequest, "invalid_request", "cannot read request body")
 				return
 			}
