@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -433,5 +434,58 @@ func TestWebhookResolvesDroppedResponse(t *testing.T) {
 		`SELECT COUNT(*) FROM payments WHERE booking_id = $1 AND status = 'succeeded'`, bookingID).Scan(&payments)
 	if payments != 1 {
 		t.Errorf("succeeded payments rows = %d, want exactly 1 (charged once)", payments)
+	}
+}
+
+// A delivery that could not be processed must stay retryable: if the dedup row
+// alone counted as handled, the retry the 5xx asked for would be ignored.
+func TestWebhookRetryAfterFailureProcesses(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	sim := paymentsim.NewServer("ps_test_localdev")
+	var down atomic.Bool
+	pay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		sim.ServeHTTP(w, r)
+	}))
+	t.Cleanup(pay.Close)
+	pc := booking.NewPaymentClient(pay.URL, "ps_test_localdev")
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	api.NewWebhookHandler(pool, rdb, webhookSecret, pc).Mount(r)
+	ts := httptest.NewServer(r)
+	t.Cleanup(ts.Close)
+
+	_, tierID := seedTier(t, pool, 50000, 10)
+	held := stuckBookingFor(t, pool, rdb, pc, tierID, "wh-retry", "tok_visa")
+	body := webhookBody(t, "evt-retry", "wh-retry", "charge.succeeded")
+
+	down.Store(true)
+	if code, out := deliver(t, ts, body, "", time.Now().Unix()); code != http.StatusServiceUnavailable {
+		t.Fatalf("first delivery = %d %v, want 503", code, out)
+	}
+	var processed *time.Time
+	if err := pool.QueryRow(context.Background(),
+		`SELECT processed_at FROM webhook_events_seen WHERE event_id = 'evt-retry'`).Scan(&processed); err != nil {
+		t.Fatalf("read dedup row: %v", err)
+	}
+	if processed != nil {
+		t.Error("an unresolved delivery was marked processed")
+	}
+
+	down.Store(false)
+	if code, out := deliver(t, ts, body, "", time.Now().Unix()); code != http.StatusOK {
+		t.Fatalf("retry = %d %v, want 200", code, out)
+	}
+	if got := bookingStatusOf(t, pool, held.BookingID); got != "confirmed" {
+		t.Errorf("booking = %s, want confirmed", got)
+	}
+
+	code, out := deliver(t, ts, body, "", time.Now().Unix())
+	if got := out["data"].(map[string]any)["status"]; code != http.StatusOK || got != "duplicate_ignored" {
+		t.Errorf("third delivery = %d %v, want 200 duplicate_ignored", code, got)
 	}
 }
