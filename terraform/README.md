@@ -98,6 +98,9 @@ make tf-apply                     # 4. ~12 min, RDS is the slow part
 make tf-migrate                   # 5. schema, as a one-shot ECS task
 curl http://$(terraform -chdir=terraform output -raw alb_dns_name)/v1/health
                                   # 6. should return the git SHA you pushed
+curl -i http://$(terraform -chdir=terraform output -raw alb_dns_name)/metrics
+                                  # 7. must be 403; the Prometheus API target
+                                  #    must still be up (it scrapes the task)
 ```
 
 Step 2 before step 4 is not optional. ECR repositories are created by

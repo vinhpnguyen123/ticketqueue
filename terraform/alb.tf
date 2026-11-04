@@ -52,3 +52,26 @@ resource "aws_lb_listener" "http" {
     target_group_arn = aws_lb_target_group.api.arn
   }
 }
+
+# /metrics shares the API's port, and the listener forwards every path, so this
+# is what keeps it private (§11a). Prometheus scrapes tasks directly from inside
+# the VPC and never comes through here.
+resource "aws_lb_listener_rule" "block_metrics" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 1
+
+  condition {
+    path_pattern {
+      values = ["/metrics", "/metrics/*"]
+    }
+  }
+
+  action {
+    type = "fixed-response"
+    fixed_response {
+      content_type = "text/plain"
+      status_code  = "403"
+      message_body = "forbidden"
+    }
+  }
+}

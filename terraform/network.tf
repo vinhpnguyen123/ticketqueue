@@ -94,7 +94,10 @@ resource "aws_security_group" "api" {
   }
 
   ingress {
-    description = "Prometheus scrape of /metrics, from inside the VPC only. §11a: metrics are never exposed publicly, and that is enforced here rather than by hoping nobody finds the port. The API serves /metrics on its app port, so this rule is what keeps it internal."
+    # This rule keeps direct access internal, but it does NOT protect /metrics
+    # from the internet: the ALB is allowed in above and forwards any path. The
+    # listener rule in alb.tf is what blocks /metrics publicly (§11a).
+    description = "Prometheus scrape of /metrics from inside the VPC"
     from_port   = 8080
     to_port     = 8080
     protocol    = "tcp"
@@ -211,7 +214,8 @@ resource "aws_security_group" "loadgen" {
   dynamic "ingress" {
     for_each = var.loadgen_ssh_cidr == "" ? [] : [var.loadgen_ssh_cidr]
     content {
-      description = "SSH from one address. Never 0.0.0.0/0 — this box holds the load-test credentials."
+      # Never 0.0.0.0/0: this box holds the load-test credentials.
+      description = "SSH from one address"
       from_port   = 22
       to_port     = 22
       protocol    = "tcp"
