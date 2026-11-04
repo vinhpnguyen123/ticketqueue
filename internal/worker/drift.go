@@ -127,7 +127,9 @@ func (d *DriftChecker) checkInventory(ctx context.Context, rdb *redis.Client, po
 		if errors.Is(err, redis.Nil) {
 			// Never initialised (or evicted). Seeding it from truth is not a
 			// correction and must not be counted as drift.
-			if err := rdb.Set(ctx, key, t.truth, 0).Err(); err != nil {
+			// SetNX: a purchase initialising the same key may have decremented
+			// it since the read above, and truth here is older than that.
+			if err := rdb.SetNX(ctx, key, t.truth, 0).Err(); err != nil {
 				return fmt.Errorf("lazy init %s: %w", key, err)
 			}
 			delete(d.pending, t.id)
@@ -153,10 +155,16 @@ func (d *DriftChecker) checkInventory(ctx context.Context, rdb *redis.Client, po
 		}
 
 		// Same numbers twice running: real drift. Postgres wins (§3 #1).
-		if err := rdb.Set(ctx, key, t.truth, 0).Err(); err != nil {
+		applied, err := casInventory(ctx, rdb, key, cached, t.truth)
+		if err != nil {
 			return fmt.Errorf("correct %s: %w", key, err)
 		}
 		delete(d.pending, t.id)
+		if !applied {
+			// The counter moved after we read it, so work is in flight and the
+			// numbers above are stale. Start the two-cycle check over.
+			continue
+		}
 		metrics.InventoryDrift.Inc()
 		slog.Warn("inventory drift corrected", "tier_id", t.id, "was", cached, "now", t.truth)
 
@@ -173,6 +181,21 @@ func (d *DriftChecker) checkInventory(ctx context.Context, rdb *redis.Client, po
 		}
 	}
 	return nil
+}
+
+// casInventoryScript writes value only if the key still holds expected, so a
+// reservation or compensation landing between the read and this write survives.
+var casInventoryScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+	redis.call('SET', KEYS[1], ARGV[2])
+	return 1
+end
+return 0
+`)
+
+func casInventory(ctx context.Context, rdb *redis.Client, key string, expected, value int64) (bool, error) {
+	applied, err := casInventoryScript.Run(ctx, rdb, []string{key}, expected, value).Int()
+	return applied == 1, err
 }
 
 // ---------------------------------------------------------------- JOB B

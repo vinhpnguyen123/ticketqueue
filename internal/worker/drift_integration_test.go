@@ -373,3 +373,45 @@ func TestDriftCycleRepairsQueue(t *testing.T) {
 		t.Errorf("queue after drift cycle = %v, want %v", got, users)
 	}
 }
+
+// The value moved after the drift checker read it: a reservation or a
+// compensation landed, and the repair must not erase it.
+func TestCasInventoryKeepsInterveningDelta(t *testing.T) {
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	key := booking.InventoryKey("cas-tier")
+	if err := rdb.Set(ctx, key, 7, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := casInventory(ctx, rdb, key, 9, 10)
+	if err != nil {
+		t.Fatalf("cas: %v", err)
+	}
+	if applied {
+		t.Error("cas applied although the value had moved")
+	}
+	if got, _ := rdb.Get(ctx, key).Int64(); got != 7 {
+		t.Errorf("value = %d, want 7 preserved", got)
+	}
+}
+
+func TestCasInventoryAppliesWhenUnchanged(t *testing.T) {
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	key := booking.InventoryKey("cas-tier")
+	if err := rdb.Set(ctx, key, 9, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := casInventory(ctx, rdb, key, 9, 10)
+	if err != nil {
+		t.Fatalf("cas: %v", err)
+	}
+	if !applied {
+		t.Error("cas did not apply on an unchanged value")
+	}
+	if got, _ := rdb.Get(ctx, key).Int64(); got != 10 {
+		t.Errorf("value = %d, want 10", got)
+	}
+}
