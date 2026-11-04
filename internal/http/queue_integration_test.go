@@ -240,3 +240,43 @@ func TestQueuePositionAdmitted(t *testing.T) {
 		t.Errorf("purchase token sub = %q, want %q", claims.Subject, userID)
 	}
 }
+
+// A rejoin must not put an admitted user back in the waiting set: position would
+// report "waiting" and hide the token while their window runs out.
+func TestRejoinWhileAdmittedKeepsToken(t *testing.T) {
+	ts, pool, rdb := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	userID, tok := registerUser(t, ts, "rejoin@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	ctx := context.Background()
+
+	doQueue(t, http.MethodPost, base+"/join", tok, nil)
+	if _, err := pool.Exec(ctx,
+		`UPDATE queue_entries SET status = 'admitted', admitted_at = NOW()
+		 WHERE user_id = $1 AND event_id = $2`, userID, eventID); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	if err := rdb.ZRem(ctx, queue.Key(eventID), userID).Err(); err != nil {
+		t.Fatalf("zrem: %v", err)
+	}
+	var original queuePositionBody
+	doQueue(t, http.MethodGet, base+"/position", tok, &original)
+
+	var rejoin queuePositionBody
+	resp := doQueue(t, http.MethodPost, base+"/join", tok, &rejoin)
+	if resp.StatusCode != http.StatusOK || rejoin.Data.Status != "admitted" || rejoin.Data.PurchaseToken == "" {
+		t.Fatalf("rejoin status=%d body=%+v, want 200 admitted with a token", resp.StatusCode, rejoin.Data)
+	}
+	if !rejoin.Data.WindowExpiresAt.Equal(original.Data.WindowExpiresAt) {
+		t.Errorf("window moved: %v, was %v", rejoin.Data.WindowExpiresAt, original.Data.WindowExpiresAt)
+	}
+	if n, err := rdb.ZCard(ctx, queue.Key(eventID)).Result(); err != nil || n != 0 {
+		t.Errorf("waiting set size = %d, err = %v, want 0", n, err)
+	}
+
+	var pos queuePositionBody
+	doQueue(t, http.MethodGet, base+"/position", tok, &pos)
+	if pos.Data.Status != "admitted" || pos.Data.PurchaseToken == "" {
+		t.Errorf("position after rejoin = %+v, want admitted with a token", pos.Data)
+	}
+}

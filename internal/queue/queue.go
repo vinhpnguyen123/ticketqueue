@@ -25,6 +25,10 @@ import (
 // ErrNotInQueue is returned by Leave when the user has no active queue entry.
 var ErrNotInQueue = errors.New("not in queue")
 
+// ErrAlreadyAdmitted is returned by Join when the user's active entry is
+// already admitted: they belong in their purchase window, not the waiting set.
+var ErrAlreadyAdmitted = errors.New("already admitted")
+
 // Key returns the Redis sorted-set key for an event's queue.
 func Key(eventID string) string {
 	return "queue:" + eventID
@@ -54,11 +58,15 @@ func Join(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, even
 		// entry. Fetch its original joined_at so the ZADD NX below can
 		// self-heal a missing Redis member with the correct score.
 		alreadyInQueue = true
+		var status string
 		err = db.QueryRow(ctx,
-			`SELECT joined_at FROM queue_entries
+			`SELECT joined_at, status FROM queue_entries
 			 WHERE user_id = $1 AND event_id = $2 AND status IN ('waiting', 'admitted')`,
 			userID, eventID,
-		).Scan(&joinedAt)
+		).Scan(&joinedAt, &status)
+		if err == nil && status == "admitted" {
+			return 0, true, ErrAlreadyAdmitted
+		}
 	}
 	if err != nil {
 		return 0, false, fmt.Errorf("insert queue entry: %w", err)

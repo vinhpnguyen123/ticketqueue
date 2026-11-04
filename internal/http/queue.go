@@ -83,6 +83,10 @@ func (h *QueueHandler) Join(w http.ResponseWriter, r *http.Request) {
 	}
 
 	position, alreadyInQueue, err := queue.Join(r.Context(), h.rdb, h.pool, userID, e.ID)
+	if errors.Is(err, queue.ErrAlreadyAdmitted) {
+		h.respondAdmitted(w, r, e, userID)
+		return
+	}
 	if err != nil {
 		slog.Error("queue: join", "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to join queue")
@@ -146,9 +150,15 @@ func (h *QueueHandler) Position(w http.ResponseWriter, r *http.Request) {
 
 	// ZRANK missed: the user may have been admitted (promotion removes the
 	// member from the waiting set but keeps the durable row as 'admitted').
+	h.respondAdmitted(w, r, e, userID)
+}
+
+// respondAdmitted answers from the durable row: the purchase token and the
+// original window for an admitted user, 404 for anyone else.
+func (h *QueueHandler) respondAdmitted(w http.ResponseWriter, r *http.Request, e event.EventWithTiers, userID string) {
 	var status string
 	var admittedAt *time.Time
-	err = h.pool.QueryRow(r.Context(),
+	err := h.pool.QueryRow(r.Context(),
 		`SELECT status, admitted_at FROM queue_entries
 		 WHERE user_id = $1 AND event_id = $2 AND status IN ('waiting', 'admitted')`,
 		userID, e.ID,
