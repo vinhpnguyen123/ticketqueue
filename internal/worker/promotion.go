@@ -20,6 +20,11 @@ import (
 // PromotionInterval is how often the promotion worker runs a cycle.
 const PromotionInterval = 5 * time.Second
 
+// PromotionBatch caps admissions per event per cycle, so one backlog cannot hold
+// the cycle away from other events and the expired-window sweep. Jitter already
+// limits admissions to about 4 a second, so this bounds time, not throughput.
+const PromotionBatch = 50
+
 // jitter staggers admissions within a batch so freshly admitted users don't
 // hit the purchase endpoint as one thundering herd. Var so tests can zero it.
 var jitter = func() {
@@ -68,11 +73,19 @@ func PromoteCycle(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool) er
 }
 
 // promoteEvent admits waiting users one at a time until the event is full, the
-// queue is empty, or the worker is shutting down. Postgres decides who is next,
-// so a crash at any point leaves everyone not yet admitted still 'waiting' and
-// still reachable next cycle. Redis only mirrors the outcome for position reads.
+// queue is empty, the pass has used its budget, or the worker is shutting down.
+// Postgres decides who is next, so a crash at any point leaves everyone not yet
+// admitted still 'waiting' and still reachable next cycle. Redis only mirrors
+// the outcome for position reads.
+//
+// The budget matters because admitNext recounts capacity: windows that expire
+// or leave mid-pass look free, and without a limit a short window could keep
+// this loop on one event until its whole queue is gone.
 func promoteEvent(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool, eventID string, maxWindows, windowSeconds int) error {
-	for ctx.Err() == nil {
+	for range min(maxWindows, PromotionBatch) {
+		if ctx.Err() != nil {
+			return nil
+		}
 		userID, admitted, err := admitNext(ctx, pool, eventID, maxWindows, windowSeconds)
 		if err != nil {
 			return err

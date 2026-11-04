@@ -288,3 +288,77 @@ func TestConcurrentPromotionRespectsCapacity(t *testing.T) {
 		t.Errorf("admitted = %d, want 1 (max_concurrent_windows)", admitted)
 	}
 }
+
+// Windows that free up mid-pass must wait for the next cycle: chasing them would
+// keep one event's backlog running and starve every other event and the sweep.
+func TestPromoteStopsAtOnePassOfCapacity(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := seedEvent(t, pool, 1, 300)
+	seedUsers(t, pool, rdb, eventID, 5)
+
+	saved := jitter
+	jitter = func() { // every admitted window has already run out
+		if _, err := pool.Exec(ctx,
+			`UPDATE queue_entries SET admitted_at = NOW() - INTERVAL '1 hour'
+			 WHERE event_id = $1 AND status = 'admitted'`, eventID); err != nil {
+			t.Errorf("expire window: %v", err)
+		}
+	}
+	defer func() { jitter = saved }()
+
+	if err := PromoteCycle(ctx, rdb, pool); err != nil {
+		t.Fatalf("cycle: %v", err)
+	}
+	var waiting int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM queue_entries WHERE event_id = $1 AND status = 'waiting'`, eventID,
+	).Scan(&waiting); err != nil {
+		t.Fatal(err)
+	}
+	if waiting != 4 {
+		t.Errorf("waiting = %d, want 4 (one admission for one window)", waiting)
+	}
+}
+
+// A huge capacity must not hold the cycle either: jitter alone makes each
+// admission cost ~250ms, so the batch is what bounds the time per event.
+func TestPromoteCapsBatchPerEvent(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := seedEvent(t, pool, 1000, 300)
+	seedUsers(t, pool, rdb, eventID, PromotionBatch+5)
+
+	if err := PromoteCycle(ctx, rdb, pool); err != nil {
+		t.Fatalf("cycle: %v", err)
+	}
+	var admitted int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM queue_entries WHERE event_id = $1 AND status = 'admitted'`, eventID,
+	).Scan(&admitted); err != nil {
+		t.Fatal(err)
+	}
+	if admitted != PromotionBatch {
+		t.Errorf("admitted = %d, want %d", admitted, PromotionBatch)
+	}
+}
+
+// A commit that Redis never hears about is still an admission.
+func TestPromoteCommitsWhenRedisFails(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := seedEvent(t, pool, 1, 300)
+	users := seedUsers(t, pool, rdb, eventID, 1)
+
+	dead := redis.NewClient(&redis.Options{Addr: "localhost:1"})
+	defer dead.Close()
+	if err := PromoteCycle(ctx, dead, pool); err != nil {
+		t.Fatalf("cycle: %v", err)
+	}
+	if got := entryStatus(t, pool, users[0], eventID); got != "admitted" {
+		t.Errorf("status = %q, want admitted", got)
+	}
+}
