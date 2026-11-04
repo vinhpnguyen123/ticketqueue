@@ -84,7 +84,7 @@ func (h *QueueHandler) Join(w http.ResponseWriter, r *http.Request) {
 
 	position, alreadyInQueue, err := queue.Join(r.Context(), h.rdb, h.pool, userID, e.ID)
 	if errors.Is(err, queue.ErrAlreadyAdmitted) {
-		h.respondAdmitted(w, r, e, userID)
+		h.respondFromEntry(w, r, e, userID, nil)
 		return
 	}
 	if err != nil {
@@ -133,29 +133,33 @@ func (h *QueueHandler) Position(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Redis being down is not the user's problem: promotion keeps admitting from
+	// Postgres, so a token must stay reachable. Fall through to the durable row.
 	rank, size, found, err := queue.Position(r.Context(), h.rdb, userID, e.ID)
 	if err != nil {
-		slog.Error("queue: position", "error", err)
-		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to read queue position")
-		return
+		slog.Warn("queue: position unavailable, answering from postgres", "error", err)
+		found = false
 	}
+	waiting := map[string]any{"status": "waiting", "position": nil, "queue_size": nil}
 	if found {
-		response.JSON(w, r, http.StatusOK, map[string]any{
-			"position":   rank + 1,
-			"queue_size": size,
-			"status":     "waiting",
-		})
-		return
+		waiting["position"], waiting["queue_size"] = rank+1, size
 	}
 
-	// ZRANK missed: the user may have been admitted (promotion removes the
-	// member from the waiting set but keeps the durable row as 'admitted').
-	h.respondAdmitted(w, r, e, userID)
+	// Redis can only be behind Postgres about who was admitted: a worker crash
+	// or a failed ZREM leaves a committed admission still in the set. Admission
+	// is FIFO, so such a member sits at the front. Only the front therefore needs
+	// the durable check, which keeps the polling crowd behind it off Postgres.
+	if found && rank >= int64(e.MaxConcurrentWindows) {
+		response.JSON(w, r, http.StatusOK, waiting)
+		return
+	}
+	h.respondFromEntry(w, r, e, userID, waiting)
 }
 
-// respondAdmitted answers from the durable row: the purchase token and the
-// original window for an admitted user, 404 for anyone else.
-func (h *QueueHandler) respondAdmitted(w http.ResponseWriter, r *http.Request, e event.EventWithTiers, userID string) {
+// respondFromEntry answers from the durable row: the purchase token and the
+// original window for an admitted user, the waiting body for a waiting one, and
+// 404 for anyone else. A nil waiting body also answers 404.
+func (h *QueueHandler) respondFromEntry(w http.ResponseWriter, r *http.Request, e event.EventWithTiers, userID string, waiting map[string]any) {
 	var status string
 	var admittedAt *time.Time
 	err := h.pool.QueryRow(r.Context(),
@@ -163,6 +167,10 @@ func (h *QueueHandler) respondAdmitted(w http.ResponseWriter, r *http.Request, e
 		 WHERE user_id = $1 AND event_id = $2 AND status IN ('waiting', 'admitted')`,
 		userID, e.ID,
 	).Scan(&status, &admittedAt)
+	if err == nil && status == "waiting" && waiting != nil {
+		response.JSON(w, r, http.StatusOK, waiting)
+		return
+	}
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && status != "admitted") {
 		response.Error(w, r, http.StatusNotFound, "not_in_queue", "you are not in this event's queue")
 		return
