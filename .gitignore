@@ -17,6 +17,7 @@ go.work.sum
 
 # Env
 .env
+.env.jwt-secret
 
 # Editor/OS
 .DS_Store

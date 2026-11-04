@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 )
 
@@ -27,9 +28,12 @@ type Config struct {
 	TrustedProxyHops int
 }
 
-// placeholderJWTSecret is the value .env.example used to ship. It is public, so
-// it is refused like a missing secret.
-const placeholderJWTSecret = "change-me-in-real-env"
+// publishedJWTSecrets have appeared in this public repo, so they are refused
+// like a missing secret: anyone could sign an admin token with them.
+var publishedJWTSecrets = []string{
+	"change-me-in-real-env",
+	"localdev-jwt-secret-not-for-production-0000",
+}
 
 // minJWTSecretBytes matches the 256-bit key HS256 expects.
 const minJWTSecretBytes = 32
@@ -48,7 +52,7 @@ func Load() (Config, error) {
 		MetricsPort:   getenv("METRICS_PORT", "9091"),
 		WebhookSecret: os.Getenv("WEBHOOK_SECRET"),
 	}
-	if cfg.JWTSecret == placeholderJWTSecret || len(cfg.JWTSecret) < minJWTSecretBytes {
+	if slices.Contains(publishedJWTSecrets, cfg.JWTSecret) || len(cfg.JWTSecret) < minJWTSecretBytes {
 		return Config{}, fmt.Errorf("JWT_SECRET must be set to a private value of at least %d bytes", minJWTSecretBytes)
 	}
 	hops, err := strconv.Atoi(getenv("TRUSTED_PROXY_HOPS", "0"))

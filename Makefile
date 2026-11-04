@@ -7,9 +7,13 @@ PORT ?= 8081
 PAYMENT_PORT ?= 8082
 PAYMENT_URL ?= http://localhost:8082
 
-# Local development only. Real deployments get theirs from Secrets Manager, and
-# the binaries refuse to start without one.
-JWT_SECRET ?= localdev-jwt-secret-not-for-production-0000
+# Real deployments get theirs from Secrets Manager. Locally, a random secret is
+# generated once into a git-ignored file, so the API and the worker share it and
+# no signing key is ever published in this repo. The binaries refuse to start
+# without one.
+ifndef JWT_SECRET
+JWT_SECRET := $(shell test -s .env.jwt-secret || (umask 077; openssl rand -hex 32 > .env.jwt-secret); cat .env.jwt-secret)
+endif
 export JWT_SECRET
 
 .PHONY: up down run run-worker run-payments logs psql migrate-up migrate-down create-test-db migrate-test-up migrate-test-down test test-integration seed demo load-seed load-storm load-journey load-calibrate verify-run sabotage chaos-1 chaos-2 chaos-3 chaos-all docker-build docker-up docker-down test-pgbouncer docker-push tf-init tf-plan tf-apply tf-migrate tf-seed tf-destroy tf-cost

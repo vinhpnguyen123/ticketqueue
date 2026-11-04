@@ -35,6 +35,7 @@ func TestLoadRejectsWeakJWTSecret(t *testing.T) {
 	for name, v := range map[string]string{
 		"missing":     "",
 		"placeholder": "change-me-in-real-env",
+		"published":   "localdev-jwt-secret-not-for-production-0000",
 		"short":       strings.Repeat("a", 31),
 	} {
 		t.Run(name, func(t *testing.T) {
