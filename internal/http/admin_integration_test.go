@@ -509,3 +509,78 @@ func TestAdminStuckExcludesHealedBooking(t *testing.T) {
 		t.Errorf("resolution_source = %v, want reconciliation", row["resolution_source"])
 	}
 }
+
+// A provider that has not finished processing answers "not found" too, so on a
+// young booking that answer proves nothing. Releasing here could sell tickets
+// the customer is paying for at this moment.
+func TestAdminReconcileFreshBookingNotFoundDefers(t *testing.T) {
+	ts, pool, rdb, _, adminTok, _ := newAdminServer(t)
+	ctx := context.Background()
+	_, tierID := seedTier(t, pool, 50000, 10)
+	held := seedHeld(t, pool, rdb, tierID, "adm-fresh-inflight", 2, 0)
+	before := redisInt(t, rdb, booking.InventoryKey(tierID))
+
+	resp, out := adminReq(t, ts, http.MethodPost, "/v1/admin/bookings/"+held.BookingID+"/reconcile", adminTok)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d body=%v, want 409", resp.StatusCode, out)
+	}
+	if got := out["error"].(map[string]any)["type"]; got != "payment_may_be_in_flight" {
+		t.Errorf("error type = %v", got)
+	}
+
+	var status string
+	var heldTickets int
+	if err := pool.QueryRow(ctx,
+		`SELECT b.status, (SELECT COUNT(*) FROM tickets WHERE booking_id = b.id AND status = 'held')
+		 FROM booking b WHERE b.id = $1`, held.BookingID).Scan(&status, &heldTickets); err != nil {
+		t.Fatalf("read booking: %v", err)
+	}
+	if status != "held" || heldTickets != 2 {
+		t.Errorf("booking = %s with %d held tickets, want held with 2", status, heldTickets)
+	}
+	if got := redisInt(t, rdb, booking.InventoryKey(tierID)); got != before {
+		t.Errorf("redis inventory = %d, want unchanged %d", got, before)
+	}
+}
+
+// Only "not found" is ambiguous on a young booking. A charge the provider can
+// show us is a definite verdict at any age.
+func TestAdminReconcileFreshBookingChargedConfirms(t *testing.T) {
+	ts, pool, rdb, pc, adminTok, _ := newAdminServer(t)
+	_, tierID := seedTier(t, pool, 50000, 10)
+	held := seedHeld(t, pool, rdb, tierID, "adm-fresh-charged", 1, 0)
+	if res := pc.Charge(context.Background(), "adm-fresh-charged", held.TotalCents, held.Currency, "tok_visa"); res.Outcome != booking.Succeeded {
+		t.Fatalf("setup charge outcome = %v", res.Outcome)
+	}
+
+	resp, out := adminReq(t, ts, http.MethodPost, "/v1/admin/bookings/"+held.BookingID+"/reconcile", adminTok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%v, want 200", resp.StatusCode, out)
+	}
+	if got := out["data"].(map[string]any)["new_status"]; got != "confirmed" {
+		t.Errorf("new_status = %v, want confirmed", got)
+	}
+}
+
+// Past StuckAfter no charge can still be in flight, so "not found" is a verdict.
+func TestAdminReconcileOldBookingNotFoundFails(t *testing.T) {
+	ts, pool, rdb, _, adminTok, _ := newAdminServer(t)
+	_, tierID := seedTier(t, pool, 50000, 10)
+	held := seedHeld(t, pool, rdb, tierID, "adm-old-nocharge", 2, 120)
+
+	resp, out := adminReq(t, ts, http.MethodPost, "/v1/admin/bookings/"+held.BookingID+"/reconcile", adminTok)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body=%v, want 200", resp.StatusCode, out)
+	}
+	if got := out["data"].(map[string]any)["new_status"]; got != "failed" {
+		t.Errorf("new_status = %v, want failed", got)
+	}
+	var released int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM tickets WHERE ticket_tier_id = $1 AND status = 'available'`, tierID).Scan(&released); err != nil {
+		t.Fatalf("count tickets: %v", err)
+	}
+	if released != 10 {
+		t.Errorf("available tickets = %d, want all 10 released", released)
+	}
+}

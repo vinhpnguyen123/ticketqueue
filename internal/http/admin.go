@@ -156,6 +156,13 @@ func (h *AdminHandler) Reconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if res.Provider == booking.ProviderInFlight {
+		response.ErrorWithDetails(w, r, http.StatusConflict, "payment_may_be_in_flight",
+			"provider has no record yet and the charge may still land; booking left held",
+			map[string]any{"booking_id": id, "status": "held"})
+		return
+	}
+
 	response.JSON(w, r, http.StatusOK, map[string]any{
 		"booking_id":      id,
 		"previous_status": status,
