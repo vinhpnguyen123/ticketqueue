@@ -225,3 +225,35 @@ func TestConcurrentJoin(t *testing.T) {
 		seen[rank] = true
 	}
 }
+
+// Postgres first: a failed leave must leave both stores saying "still in the
+// queue", so a retry works and nothing disagrees.
+func TestLeaveDBFailureKeepsRedisMember(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := createEvent(t, pool, "on_sale")
+	users := createUsers(t, pool, 1)
+	joinAll(t, pool, rdb, eventID, users)
+
+	if err := queue.Leave(ctx, rdb, closedPool(t, pool), users[0], eventID); err == nil {
+		t.Fatal("leave with a dead database returned nil")
+	}
+	if _, err := rdb.ZScore(ctx, queue.Key(eventID), users[0]).Result(); err != nil {
+		t.Fatalf("member gone after a failed leave: %v", err)
+	}
+
+	if err := queue.Leave(ctx, rdb, pool, users[0], eventID); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM queue_entries WHERE user_id = $1`, users[0]).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "left" {
+		t.Errorf("status = %s, want left", status)
+	}
+	if n, err := rdb.ZCard(ctx, queue.Key(eventID)).Result(); err != nil || n != 0 {
+		t.Errorf("zcard = %d, err = %v, want 0", n, err)
+	}
+}

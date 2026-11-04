@@ -112,13 +112,11 @@ func Position(ctx context.Context, rdb *redis.Client, userID, eventID string) (r
 	return rank, size, found, nil
 }
 
-// Leave removes the user from the Redis set and marks their active
-// queue_entries row as left. Returns ErrNotInQueue when no active row exists.
+// Leave marks the user's active queue_entries row as left, then removes them
+// from the Redis set. Postgres first (§3): a failed update leaves both stores
+// agreeing the user is still queued, so a retry is safe. Returns ErrNotInQueue
+// when no active row exists.
 func Leave(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, eventID string) error {
-	if err := rdb.ZRem(ctx, Key(eventID), userID).Err(); err != nil {
-		return fmt.Errorf("zrem queue member: %w", err)
-	}
-
 	tag, err := db.Exec(ctx,
 		`UPDATE queue_entries SET status = 'left', left_at = NOW()
 		 WHERE user_id = $1 AND event_id = $2 AND status IN ('waiting', 'admitted')`,
@@ -129,6 +127,12 @@ func Leave(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, eve
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotInQueue
+	}
+
+	// The leave is durable from here, so this is not the caller's failure: the
+	// next SyncFromPostgres removes the member.
+	if err := rdb.ZRem(ctx, Key(eventID), userID).Err(); err != nil {
+		slog.Error("zrem after leave failed", "user_id", userID, "event_id", eventID, "error", err)
 	}
 
 	audit(ctx, db, userID, eventID, "queue_left")
