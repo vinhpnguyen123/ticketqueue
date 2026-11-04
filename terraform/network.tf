@@ -136,7 +136,7 @@ resource "aws_security_group" "worker" {
 
 resource "aws_security_group" "payment" {
   name        = "${local.name}-payment"
-  description = "Simulated provider. In reality this is another company's service and would not be in this VPC."
+  description = "Simulated provider. In reality this is an external service and would not be in this VPC."
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -170,7 +170,7 @@ resource "aws_security_group" "rds" {
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description     = "5432 from the API (via its PgBouncer sidecar, which shares the task's ENI and therefore this group), the worker, and the one-shot migration task."
+    description     = "5432 from the API (via its PgBouncer sidecar, which shares the ENI of the task and therefore this group), the worker, and the one-shot migration task."
     from_port       = 5432
     to_port         = 5432
     protocol        = "tcp"
