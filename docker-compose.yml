@@ -92,6 +92,7 @@ services:
       redis: {condition: service_healthy}
     environment:
       DATABASE_URL: postgres://ticketqueue:localdev@pgbouncer:6432/ticketqueue?sslmode=disable
+      JWT_SECRET: "${JWT_SECRET:-localdev-jwt-secret-not-for-production-0000}"
       PGBOUNCER: "true"
       POOL_MAX_CONNS: "${POOL_MAX_CONNS:-10}"
       REDIS_ADDR: redis:6379
@@ -109,6 +110,7 @@ services:
       redis: {condition: service_healthy}
     environment:
       DATABASE_URL: postgres://ticketqueue:localdev@pgbouncer:6432/ticketqueue?sslmode=disable
+      JWT_SECRET: "${JWT_SECRET:-localdev-jwt-secret-not-for-production-0000}"
       PGBOUNCER: "true"
       POOL_MAX_CONNS: "${POOL_MAX_CONNS:-10}"
       REDIS_ADDR: redis:6379

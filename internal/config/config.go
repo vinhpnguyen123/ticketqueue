@@ -27,20 +27,29 @@ type Config struct {
 	TrustedProxyHops int
 }
 
-// Load reads configuration from the environment, applying local-dev
-// defaults for anything unset. Once we run in real environments,
-// JWT_SECRET must be set explicitly and Load will fail fast if it is
-// empty; for now local dev gets a default.
+// placeholderJWTSecret is the value .env.example used to ship. It is public, so
+// it is refused like a missing secret.
+const placeholderJWTSecret = "change-me-in-real-env"
+
+// minJWTSecretBytes matches the 256-bit key HS256 expects.
+const minJWTSecretBytes = 32
+
+// Load reads configuration from the environment, applying local-dev defaults for
+// settings that are harmless to default. Secrets are not among them: JWT_SECRET
+// signs admin tokens, so a missing or known value fails startup.
 func Load() (Config, error) {
 	cfg := Config{
 		DatabaseURL:   getenv("DATABASE_URL", "postgres://ticketqueue:localdev@localhost:5434/ticketqueue?sslmode=disable"),
 		RedisAddr:     getenv("REDIS_ADDR", "localhost:6379"),
 		Port:          getenv("PORT", "8080"),
-		JWTSecret:     getenv("JWT_SECRET", "change-me-in-real-env"),
+		JWTSecret:     os.Getenv("JWT_SECRET"),
 		PaymentURL:    getenv("PAYMENT_URL", "http://localhost:8081"),
 		PaymentKey:    getenv("PAYMENT_API_KEY", "ps_test_localdev"),
 		MetricsPort:   getenv("METRICS_PORT", "9091"),
-		WebhookSecret: getenv("WEBHOOK_SECRET", "whsec_localdev"),
+		WebhookSecret: os.Getenv("WEBHOOK_SECRET"),
+	}
+	if cfg.JWTSecret == placeholderJWTSecret || len(cfg.JWTSecret) < minJWTSecretBytes {
+		return Config{}, fmt.Errorf("JWT_SECRET must be set to a private value of at least %d bytes", minJWTSecretBytes)
 	}
 	hops, err := strconv.Atoi(getenv("TRUSTED_PROXY_HOPS", "0"))
 	if err != nil || hops < 0 {
