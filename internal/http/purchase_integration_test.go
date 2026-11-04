@@ -748,3 +748,78 @@ func TestPurchaseSiblingConfirmedFirst(t *testing.T) {
 		t.Errorf("reconciliation_needed rows = %d, want 0 (nothing to refund)", flags)
 	}
 }
+
+// bookingCharge returns a booking's provider key and total, and the provider's
+// charge recorded under that key.
+func bookingCharge(t *testing.T, pool *pgxpool.Pool, bookingID string) (key string, totalCents int64, charge map[string]any) {
+	t.Helper()
+	if err := pool.QueryRow(context.Background(),
+		`SELECT idempotency_key, total_cents FROM booking WHERE id = $1`, bookingID,
+	).Scan(&key, &totalCents); err != nil {
+		t.Fatalf("load booking: %v", err)
+	}
+	return key, totalCents, lookupCharge(t, key)
+}
+
+// A client key is only unique per user. Reusing one across users must never
+// let the second user ride on the first user's charge.
+func TestPurchaseSameKeyTwoUsersChargedSeparately(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	cheapEvent, cheapTier := seedTier(t, pool, 1000, 5)
+	vipEvent, vipTier := seedTier(t, pool, 50000, 5)
+	_, jwtA, tokA := admittedUser(t, pool, cheapEvent, 1)
+	_, jwtB, tokB := admittedUser(t, pool, vipEvent, 2)
+
+	respA, outA := purchase(t, ts, jwtA, "shared-key", purchaseBody(cheapEvent, cheapTier, 1, tokA))
+	respB, outB := purchase(t, ts, jwtB, "shared-key", purchaseBody(vipEvent, vipTier, 1, tokB))
+	if respA.StatusCode != http.StatusCreated || respB.StatusCode != http.StatusCreated {
+		t.Fatalf("statuses = %d, %d, want 201, 201 (bodies %v, %v)", respA.StatusCode, respB.StatusCode, outA, outB)
+	}
+
+	keyA, totalA, chargeA := bookingCharge(t, pool, bookingIDOf(t, outA))
+	keyB, totalB, chargeB := bookingCharge(t, pool, bookingIDOf(t, outB))
+	if keyA == keyB {
+		t.Errorf("both bookings share provider key %q", keyA)
+	}
+	if chargeA["id"] == chargeB["id"] {
+		t.Errorf("both bookings share charge %v", chargeA["id"])
+	}
+	if got := int64(chargeA["amount"].(float64)); got != totalA {
+		t.Errorf("user A charged %d, booking total %d", got, totalA)
+	}
+	if got := int64(chargeB["amount"].(float64)); got != totalB {
+		t.Errorf("user B charged %d, booking total %d", got, totalB)
+	}
+}
+
+// The provider key is generated per booking, so a retry must never reach the
+// code that generates one.
+func TestPurchaseRetrySameKeyOneCharge(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	eventID, tierID := seedTier(t, pool, 1000, 5)
+	userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+	body := purchaseBody(eventID, tierID, 1, purchaseTok)
+
+	first, firstOut := purchase(t, ts, jwtTok, "retry-key", body)
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first status = %d body=%v", first.StatusCode, firstOut)
+	}
+	second, secondOut := purchase(t, ts, jwtTok, "retry-key", body)
+	if second.Header.Get("Idempotency-Replayed") != "true" {
+		t.Errorf("second response was not a replay: %d %v", second.StatusCode, secondOut)
+	}
+	if bookingIDOf(t, secondOut) != bookingIDOf(t, firstOut) {
+		t.Errorf("replay returned a different booking")
+	}
+
+	var bookings, payments int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(DISTINCT b.id), COUNT(p.id) FILTER (WHERE p.status = 'succeeded')
+		 FROM booking b LEFT JOIN payments p ON p.booking_id = b.id WHERE b.user_id = $1`, userID,
+	).Scan(&bookings, &payments); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if bookings != 1 || payments != 1 {
+		t.Errorf("bookings = %d, succeeded payments = %d, want 1 and 1", bookings, payments)
+	}
+}

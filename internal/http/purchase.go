@@ -145,12 +145,18 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// TX1: Layers 2 and 3.
-	idemKey := r.Header.Get("Idempotency-Key")
+	//
+	// The provider's ledger is global, but a client's Idempotency-Key is only
+	// unique per user, so it must never reach the provider: a second user
+	// reusing a key would be handed the first user's charge. One key per
+	// booking is enough, because a retry never gets here — the idempotency
+	// middleware replays or rejects it first.
+	providerKey := uuid.NewString()
 	// Timings wrap the call and are recorded after it returns, so no
 	// instrumentation ever runs while a row lock is held (§11a).
 	tx1Start := time.Now()
 	held, err := booking.HoldTickets(r.Context(), h.pool, userID, tier, req.Quantity,
-		idemKey, middleware.GetReqID(r.Context()))
+		providerKey, middleware.GetReqID(r.Context()))
 	metrics.PurchasePhase.WithLabelValues(metrics.PhaseTX1).Observe(time.Since(tx1Start).Seconds())
 	if err != nil {
 		// TX1 rolled back but Layer 1 already decremented: give it back.
@@ -175,7 +181,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// hold locks across a network call. Charge classifies every outcome
 	// (succeeded / declined / ambiguous) so PHASE 3 branches in one place.
 	payStart := time.Now()
-	charge := h.payments.Charge(r.Context(), idemKey, held.TotalCents, held.Currency, req.PaymentToken)
+	charge := h.payments.Charge(r.Context(), providerKey, held.TotalCents, held.Currency, req.PaymentToken)
 	metrics.PurchasePhase.WithLabelValues(metrics.PhasePaymentCall).Observe(time.Since(payStart).Seconds())
 
 	// --- PHASE 3: TX2 finalization based on the payment outcome.
