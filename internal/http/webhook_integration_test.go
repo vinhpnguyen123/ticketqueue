@@ -53,7 +53,7 @@ func newWebhookServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Cli
 func deliver(t *testing.T, ts *httptest.Server, body []byte, sig string, ts64 int64) (int, map[string]any) {
 	t.Helper()
 	if sig == "" {
-		sig = paymentsim.Sign(body, webhookSecret)
+		sig = paymentsim.Sign(strconv.FormatInt(ts64, 10), body, webhookSecret)
 	}
 	req, err := http.NewRequest(http.MethodPost, ts.URL+"/webhooks/payment-service", bytes.NewReader(body))
 	if err != nil {
@@ -198,10 +198,11 @@ func TestWebhookRejectsTamperedBody(t *testing.T) {
 	held := stuckBookingFor(t, pool, rdb, pc, tierID, "wh-tamper-1", "tok_visa")
 
 	original := webhookBody(t, uuid.NewString(), "wh-tamper-1", "charge.succeeded")
-	sig := paymentsim.Sign(original, webhookSecret)
+	now := time.Now().Unix()
+	sig := paymentsim.Sign(strconv.FormatInt(now, 10), original, webhookSecret)
 	tampered := webhookBody(t, uuid.NewString(), "wh-tamper-1", "charge.failed")
 
-	status, out := deliver(t, ts, tampered, sig, time.Now().Unix())
+	status, out := deliver(t, ts, tampered, sig, now)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("status = %d body=%v, want 401", status, out)
 	}
@@ -487,5 +488,23 @@ func TestWebhookRetryAfterFailureProcesses(t *testing.T) {
 	code, out := deliver(t, ts, body, "", time.Now().Unix())
 	if got := out["data"].(map[string]any)["status"]; code != http.StatusOK || got != "duplicate_ignored" {
 		t.Errorf("third delivery = %d %v, want 200 duplicate_ignored", code, got)
+	}
+}
+
+// The signature must cover the timestamp, or a captured delivery can be given a
+// fresh one and pass the freshness check forever.
+func TestWebhookRejectsRetimestampedReplay(t *testing.T) {
+	ts, pool, rdb, pc := newWebhookServer(t)
+	_, tierID := seedTier(t, pool, 50000, 10)
+	stuckBookingFor(t, pool, rdb, pc, tierID, "wh-replay-ts", "tok_visa")
+	body := webhookBody(t, "evt-replay-ts", "wh-replay-ts", "charge.succeeded")
+
+	captured := strconv.FormatInt(time.Now().Add(-time.Hour).Unix(), 10)
+	code, out := deliver(t, ts, body, paymentsim.Sign(captured, body, webhookSecret), time.Now().Unix())
+	if code != http.StatusUnauthorized {
+		t.Fatalf("status = %d %v, want 401", code, out)
+	}
+	if got := out["error"].(map[string]any)["type"]; got != "invalid_signature" {
+		t.Errorf("error type = %v, want invalid_signature", got)
 	}
 }

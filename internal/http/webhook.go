@@ -73,12 +73,13 @@ func (h *WebhookHandler) Receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.verify(raw, r.Header.Get("X-Webhook-Signature")) {
+	ts := r.Header.Get("X-Webhook-Timestamp")
+	if !h.verify(raw, ts, r.Header.Get("X-Webhook-Signature")) {
 		slog.Warn("webhook rejected: bad signature")
 		response.Error(w, r, http.StatusUnauthorized, "invalid_signature", "signature does not match")
 		return
 	}
-	if !freshTimestamp(r.Header.Get("X-Webhook-Timestamp")) {
+	if !freshTimestamp(ts) {
 		slog.Warn("webhook rejected: stale timestamp")
 		response.Error(w, r, http.StatusUnauthorized, "timestamp_expired", "delivery is too old")
 		return
@@ -181,11 +182,11 @@ func (h *WebhookHandler) markProcessed(r *http.Request, eventID string) {
 
 // verify checks the HMAC in constant time. An early return on a length
 // mismatch is fine — the length is not secret.
-func (h *WebhookHandler) verify(raw []byte, got string) bool {
+func (h *WebhookHandler) verify(raw []byte, ts, got string) bool {
 	if h.secret == "" || got == "" {
 		return false
 	}
-	return hmac.Equal([]byte(got), []byte(paymentsim.Sign(raw, h.secret)))
+	return hmac.Equal([]byte(got), []byte(paymentsim.Sign(ts, raw, h.secret)))
 }
 
 func freshTimestamp(header string) bool {
