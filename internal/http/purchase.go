@@ -131,6 +131,11 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"tier_id": "does not belong to event_id"})
 		return
 	}
+	// A purchase token proves queue admission, which can outlive the sale.
+	if !tier.OnSale {
+		response.Error(w, r, http.StatusGone, "sales_closed", "ticket sales are not open for this tier")
+		return
+	}
 
 	// Layer 1: Redis fast reject.
 	if err := booking.ReserveInventory(r.Context(), h.rdb, h.pool, tier.ID, req.Quantity); errors.Is(err, booking.ErrSoldOut) {

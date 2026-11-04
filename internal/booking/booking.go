@@ -85,15 +85,23 @@ type Tier struct {
 	EventID    string
 	PriceCents int64
 	Currency   string
+	// OnSale is true when the event is on_sale and now is inside the tier's
+	// sale window. NULL sale dates mean no limit on that side.
+	OnSale bool
 }
 
 // LoadTier fetches a tier; pgx.ErrNoRows passes through for the handler.
 func LoadTier(ctx context.Context, pool *pgxpool.Pool, tierID string) (Tier, error) {
 	var t Tier
 	err := pool.QueryRow(ctx,
-		`SELECT id, event_id, price_cents, currency FROM ticket_tier WHERE id = $1`,
+		`SELECT t.id, t.event_id, t.price_cents, t.currency,
+		        e.status = 'on_sale'
+		        AND (t.sale_start IS NULL OR NOW() >= t.sale_start)
+		        AND (t.sale_end IS NULL OR NOW() < t.sale_end)
+		 FROM ticket_tier t JOIN events e ON e.id = t.event_id
+		 WHERE t.id = $1`,
 		tierID,
-	).Scan(&t.ID, &t.EventID, &t.PriceCents, &t.Currency)
+	).Scan(&t.ID, &t.EventID, &t.PriceCents, &t.Currency, &t.OnSale)
 	return t, err
 }
 

@@ -870,3 +870,60 @@ func TestPurchaseActiveBookingCompensatesInventory(t *testing.T) {
 		t.Errorf("redis inventory = %d, want 49", got)
 	}
 }
+
+// A purchase token proves queue admission, not that the sale is still open.
+func TestPurchaseRejectedOutsideSale(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup string // $1 = event id, $2 = tier id
+	}{
+		{"event cancelled", `UPDATE events SET status = 'cancelled' WHERE id = $1 AND $2::uuid IS NOT NULL`},
+		{"event closed", `UPDATE events SET status = 'closed' WHERE id = $1 AND $2::uuid IS NOT NULL`},
+		{"before sale_start", `UPDATE ticket_tier SET sale_start = NOW() + INTERVAL '1 minute' WHERE event_id = $1 AND id = $2`},
+		{"after sale_end", `UPDATE ticket_tier SET sale_end = NOW() - INTERVAL '1 minute' WHERE event_id = $1 AND id = $2`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, pool, rdb := newPurchaseServer(t)
+			ctx := context.Background()
+			eventID, tierID := seedTier(t, pool, 1000, 5)
+			userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+			if _, err := pool.Exec(ctx, tc.setup, eventID, tierID); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+
+			resp, out := purchase(t, ts, jwtTok, "closed-key", purchaseBody(eventID, tierID, 1, purchaseTok))
+			if resp.StatusCode != http.StatusGone {
+				t.Fatalf("status = %d body=%v, want 410", resp.StatusCode, out)
+			}
+			if got := out["error"].(map[string]any)["type"]; got != "sales_closed" {
+				t.Errorf("error type = %v, want sales_closed", got)
+			}
+			var bookings int
+			if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM booking WHERE user_id = $1`, userID).Scan(&bookings); err != nil {
+				t.Fatalf("count: %v", err)
+			}
+			if bookings != 0 {
+				t.Errorf("bookings = %d, want 0", bookings)
+			}
+			if n, _ := rdb.Exists(ctx, booking.InventoryKey(tierID)).Result(); n != 0 {
+				t.Errorf("inventory was touched before the sale check")
+			}
+		})
+	}
+}
+
+func TestPurchaseAllowedInsideSaleWindow(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	eventID, tierID := seedTier(t, pool, 1000, 5)
+	_, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE ticket_tier SET sale_start = NOW() - INTERVAL '1 minute', sale_end = NOW() + INTERVAL '1 minute' WHERE id = $1`,
+		tierID); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	resp, out := purchase(t, ts, jwtTok, "open-key", purchaseBody(eventID, tierID, 1, purchaseTok))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d body=%v, want 201", resp.StatusCode, out)
+	}
+}
