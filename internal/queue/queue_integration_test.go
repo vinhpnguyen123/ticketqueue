@@ -5,11 +5,13 @@ package queue_test
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/queue"
 	"github.com/vinhpnguyen123/ticketqueue/internal/testutil"
@@ -41,6 +43,17 @@ func createUsers(t *testing.T, pool *pgxpool.Pool, n int) []string {
 	return ids
 }
 
+// closedPool returns a pool on the same database that fails every query.
+func closedPool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	dead, err := pgxpool.New(context.Background(), pool.Config().ConnString())
+	if err != nil {
+		t.Fatalf("new pool: %v", err)
+	}
+	dead.Close()
+	return dead
+}
+
 func createEvent(t *testing.T, pool *pgxpool.Pool, status string) string {
 	t.Helper()
 	var id string
@@ -55,42 +68,100 @@ func createEvent(t *testing.T, pool *pgxpool.Pool, status string) string {
 	return id
 }
 
-func TestRebuildFromPostgres(t *testing.T) {
-	pool := testutil.TestDB(t)
-	rdb := testutil.TestRedis(t)
-	ctx := context.Background()
-
-	eventID := createEvent(t, pool, "on_sale")
-	users := createUsers(t, pool, 3)
+func joinAll(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, eventID string, users []string) {
+	t.Helper()
 	for i, u := range users {
 		// Guarantee distinct joined_at micros so join order is unambiguous.
 		time.Sleep(2 * time.Millisecond)
-		pos, already, err := queue.Join(ctx, rdb, pool, u, eventID)
+		pos, already, err := queue.Join(context.Background(), rdb, pool, u, eventID)
 		if err != nil || already || pos != int64(i+1) {
 			t.Fatalf("join user %d: pos=%d already=%v err=%v", i, pos, already, err)
 		}
 	}
+}
+
+func TestSyncRestoresOrderAfterFlush(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := createEvent(t, pool, "on_sale")
+	users := createUsers(t, pool, 3)
+	joinAll(t, pool, rdb, eventID, users)
 
 	// Simulate a Redis crash losing everything.
 	if err := rdb.FlushDB(ctx).Err(); err != nil {
 		t.Fatalf("flushdb: %v", err)
 	}
-	if err := queue.RebuildFromPostgres(ctx, rdb, pool, eventID); err != nil {
-		t.Fatalf("rebuild: %v", err)
+	if err := queue.SyncFromPostgres(ctx, rdb, pool, eventID); err != nil {
+		t.Fatalf("sync: %v", err)
 	}
 
-	size, err := rdb.ZCard(ctx, queue.Key(eventID)).Result()
-	if err != nil || size != 3 {
-		t.Fatalf("zcard after rebuild = %d, err = %v, want 3", size, err)
+	got, err := rdb.ZRange(ctx, queue.Key(eventID), 0, -1).Result()
+	if err != nil {
+		t.Fatalf("zrange: %v", err)
 	}
-	for i, u := range users {
-		rank, err := rdb.ZRank(ctx, queue.Key(eventID), u).Result()
-		if err != nil {
-			t.Fatalf("zrank user %d: %v", i, err)
-		}
-		if rank != int64(i) {
-			t.Errorf("user %d rank after rebuild = %d, want %d (order not preserved)", i, rank, i)
-		}
+	if !slices.Equal(got, users) {
+		t.Errorf("order after sync = %v, want %v", got, users)
+	}
+}
+
+// The old rebuild deleted the key first, so this emptied a healthy queue.
+func TestSyncQueryFailureKeepsMembers(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := createEvent(t, pool, "on_sale")
+	joinAll(t, pool, rdb, eventID, createUsers(t, pool, 3))
+
+	if err := queue.SyncFromPostgres(ctx, rdb, closedPool(t, pool), eventID); err == nil {
+		t.Fatal("sync with a dead database returned nil")
+	}
+	if size, err := rdb.ZCard(ctx, queue.Key(eventID)).Result(); err != nil || size != 3 {
+		t.Errorf("zcard = %d, err = %v, want 3 untouched", size, err)
+	}
+}
+
+func TestSyncRemovesDepartedMember(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := createEvent(t, pool, "on_sale")
+	users := createUsers(t, pool, 2)
+	joinAll(t, pool, rdb, eventID, users)
+	if _, err := pool.Exec(ctx,
+		`UPDATE queue_entries SET status = 'left', left_at = NOW() WHERE user_id = $1`, users[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := queue.SyncFromPostgres(ctx, rdb, pool, eventID); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	got, err := rdb.ZRange(ctx, queue.Key(eventID), 0, -1).Result()
+	if err != nil {
+		t.Fatalf("zrange: %v", err)
+	}
+	if !slices.Equal(got, users[1:]) {
+		t.Errorf("members = %v, want only %v", got, users[1:])
+	}
+}
+
+func TestSyncKeepsWaitingMembersAndScores(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := createEvent(t, pool, "on_sale")
+	users := createUsers(t, pool, 2)
+	joinAll(t, pool, rdb, eventID, users)
+	before, err := rdb.ZScore(ctx, queue.Key(eventID), users[0]).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := queue.SyncFromPostgres(ctx, rdb, pool, eventID); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if after, err := rdb.ZScore(ctx, queue.Key(eventID), users[0]).Result(); err != nil || after != before {
+		t.Errorf("score = %v, err = %v, want unchanged %v", after, err, before)
 	}
 }
 

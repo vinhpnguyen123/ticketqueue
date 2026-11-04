@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -35,7 +36,7 @@ func Key(eventID string) string {
 //
 // Postgres is written FIRST, then Redis: the durable record must exist
 // before the fast path. If the Redis write fails after the Postgres insert,
-// RebuildFromPostgres will restore the member; if Postgres fails, nothing
+// SyncFromPostgres will restore the member; if Postgres fails, nothing
 // entered Redis, so there is no ghost queue member that would vanish on the
 // next rebuild.
 func Join(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, eventID string) (position int64, alreadyInQueue bool, err error) {
@@ -64,7 +65,7 @@ func Join(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, even
 	}
 
 	// Score is the Postgres joined_at as unix micros so the hot path and
-	// RebuildFromPostgres produce identical orderings. NX keeps an existing
+	// SyncFromPostgres produce identical orderings. NX keeps an existing
 	// member's score untouched on idempotent re-joins.
 	if err := rdb.ZAddNX(ctx, Key(eventID), redis.Z{
 		Score:  float64(joinedAt.UnixMicro()),
@@ -126,14 +127,18 @@ func Leave(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, eve
 	return nil
 }
 
-// RebuildFromPostgres wipes the event's Redis queue and repopulates it from
-// the durable queue_entries mirror, preserving the original join order.
-// This is the Redis-crash recovery path.
-func RebuildFromPostgres(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, eventID string) error {
-	if err := rdb.Del(ctx, Key(eventID)).Err(); err != nil {
-		return fmt.Errorf("del queue key: %w", err)
-	}
-
+// SyncFromPostgres makes the event's Redis queue match the waiting rows in
+// Postgres, keeping the original join order. It is the Redis-crash recovery
+// path, and it runs against a live queue, so it never deletes the key: a failed
+// read leaves Redis as it was.
+//
+// The order closes both races with live traffic. Members are re-checked AFTER
+// the ZADD, so a user who left since the first read is removed again. A
+// concurrent join writes Postgres first, so the re-check sees it as waiting.
+//
+// ponytail: full ZRANGE per event per drift cycle; fine at 10k waiting, switch
+// to ZSCAN if queues grow well past that.
+func SyncFromPostgres(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, eventID string) error {
 	rows, err := db.Query(ctx,
 		`SELECT user_id, joined_at FROM queue_entries
 		 WHERE event_id = $1 AND status = 'waiting'
@@ -160,12 +165,48 @@ func RebuildFromPostgres(ctx context.Context, rdb *redis.Client, db *pgxpool.Poo
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("select waiting entries: %w", err)
 	}
-	if len(members) == 0 {
+
+	if len(members) > 0 {
+		if err := rdb.ZAddNX(ctx, Key(eventID), members...).Err(); err != nil {
+			return fmt.Errorf("zadd missing members: %w", err)
+		}
+	}
+
+	inRedis, err := rdb.ZRange(ctx, Key(eventID), 0, -1).Result()
+	if err != nil {
+		return fmt.Errorf("zrange members: %w", err)
+	}
+	if len(inRedis) == 0 {
 		return nil
 	}
 
-	if err := rdb.ZAdd(ctx, Key(eventID), members...).Err(); err != nil {
-		return fmt.Errorf("zadd rebuilt members: %w", err)
+	waitingRows, err := db.Query(ctx,
+		`SELECT user_id FROM queue_entries
+		 WHERE event_id = $1 AND status = 'waiting' AND user_id = ANY($2)`,
+		eventID, inRedis,
+	)
+	if err != nil {
+		return fmt.Errorf("recheck members: %w", err)
+	}
+	waiting, err := pgx.CollectRows(waitingRows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("recheck members: %w", err)
+	}
+
+	isWaiting := make(map[string]bool, len(waiting))
+	for _, id := range waiting {
+		isWaiting[id] = true
+	}
+	var stale []any
+	for _, member := range inRedis {
+		if !isWaiting[member] {
+			stale = append(stale, member)
+		}
+	}
+	if len(stale) > 0 {
+		if err := rdb.ZRem(ctx, Key(eventID), stale...).Err(); err != nil {
+			return fmt.Errorf("zrem stale members: %w", err)
+		}
 	}
 	return nil
 }

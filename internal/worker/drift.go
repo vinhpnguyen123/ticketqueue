@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -37,8 +38,8 @@ func NewDriftChecker() *DriftChecker {
 	return &DriftChecker{pending: map[string]observation{}}
 }
 
-// Cycle runs all three jobs. They are independent: a failure in one must not
-// cost the other two their turn, so each is recovered and its error collected
+// Cycle runs all four jobs. They are independent: a failure in one must not
+// cost the others their turn, so each is recovered and its error collected
 // rather than returned immediately.
 func (d *DriftChecker) Cycle(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool) error {
 	jobs := []struct {
@@ -48,6 +49,7 @@ func (d *DriftChecker) Cycle(ctx context.Context, rdb *redis.Client, pool *pgxpo
 		{"inventory", func() error { return d.checkInventory(ctx, rdb, pool) }},
 		{"invariants", func() error { return checkInvariants(ctx, pool) }},
 		{"abandoned_queue", func() error { return sweepAbandonedQueueEntries(ctx, rdb, pool) }},
+		{"queue_sync", func() error { return syncQueues(ctx, rdb, pool) }},
 	}
 
 	var failed []string
@@ -325,4 +327,28 @@ func auditSystem(ctx context.Context, pool *pgxpool.Pool, entityType, entityID, 
 		return fmt.Errorf("audit %s: %w", action, err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------- JOB D
+
+// syncQueues repairs every on_sale event's Redis queue from Postgres. Promotion
+// reads Postgres, so a lost or stale queue never blocks admission; this keeps
+// position lookups truthful. One failing event does not cost the others a turn.
+func syncQueues(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool) error {
+	rows, err := pool.Query(ctx, `SELECT id FROM events WHERE status = 'on_sale'`)
+	if err != nil {
+		return fmt.Errorf("list on_sale events: %w", err)
+	}
+	eventIDs, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("list on_sale events: %w", err)
+	}
+
+	var errs []error
+	for _, id := range eventIDs {
+		if err := queue.SyncFromPostgres(ctx, rdb, pool, id); err != nil {
+			errs = append(errs, fmt.Errorf("event %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
 }

@@ -5,6 +5,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -348,4 +349,27 @@ func TestDriftCleanSystemStaysSilent(t *testing.T) {
 		t.Errorf("invariant audit rows = %d, want 0", n)
 	}
 	_ = ctx
+}
+
+// Runner runs a cycle at startup, so this is also recovery on restart.
+func TestDriftCycleRepairsQueue(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := seedEvent(t, pool, 1, 300)
+	users := seedUsers(t, pool, rdb, eventID, 3)
+
+	if err := rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewDriftChecker().Cycle(ctx, rdb, pool); err != nil {
+		t.Fatalf("cycle: %v", err)
+	}
+	got, err := rdb.ZRange(ctx, queue.Key(eventID), 0, -1).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, users) {
+		t.Errorf("queue after drift cycle = %v, want %v", got, users)
+	}
 }
