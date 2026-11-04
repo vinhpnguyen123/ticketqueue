@@ -112,6 +112,11 @@ func Position(ctx context.Context, rdb *redis.Client, userID, eventID string) (r
 	return rank, size, found, nil
 }
 
+// Size returns how many users are waiting in the event's queue.
+func Size(ctx context.Context, rdb *redis.Client, eventID string) (int64, error) {
+	return rdb.ZCard(ctx, Key(eventID)).Result()
+}
+
 // Leave marks the user's active queue_entries row as left, then removes them
 // from the Redis set. Postgres first (§3): a failed update leaves both stores
 // agreeing the user is still queued, so a retry is safe. Returns ErrNotInQueue

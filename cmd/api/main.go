@@ -80,7 +80,7 @@ func main() {
 		func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
 	))
 	api.NewAuthHandler(pool, rdb, cfg.JWTSecret, cfg.TrustedProxyHops).Mount(r)
-	api.NewEventsHandler(pool).Mount(r)
+	api.NewEventsHandler(pool, rdb).Mount(r)
 	api.NewQueueHandler(pool, rdb, cfg.JWTSecret).Mount(r)
 	payments := booking.NewPaymentClient(cfg.PaymentURL, cfg.PaymentKey)
 	api.NewPurchaseHandler(pool, rdb, cfg.JWTSecret, payments).Mount(r)

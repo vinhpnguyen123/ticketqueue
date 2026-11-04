@@ -10,9 +10,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/vinhpnguyen123/ticketqueue/internal/domain/event"
 	"github.com/vinhpnguyen123/ticketqueue/internal/http/response"
+	"github.com/vinhpnguyen123/ticketqueue/internal/queue"
 )
 
 const (
@@ -23,10 +25,11 @@ const (
 // EventsHandler serves the public event-browsing endpoints.
 type EventsHandler struct {
 	events *event.Repo
+	rdb    *redis.Client
 }
 
-func NewEventsHandler(pool *pgxpool.Pool) *EventsHandler {
-	return &EventsHandler{events: event.NewRepo(pool)}
+func NewEventsHandler(pool *pgxpool.Pool, rdb *redis.Client) *EventsHandler {
+	return &EventsHandler{events: event.NewRepo(pool), rdb: rdb}
 }
 
 // Mount registers the public event routes on r.
@@ -139,12 +142,20 @@ func (h *EventsHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO(week 2): replace the placeholder with the real Redis queue size.
+	// Null when Redis is down: the page should still load, and 0 would claim an
+	// empty queue nobody checked.
+	var queueSize *int64
+	if size, err := queue.Size(r.Context(), h.rdb, e.ID); err != nil {
+		slog.Warn("event queue size unavailable", "event_id", e.ID, "error", err)
+	} else {
+		queueSize = &size
+	}
+
 	response.JSON(w, r, http.StatusOK, struct {
 		eventResponse
-		Queue map[string]int `json:"queue"`
+		Queue map[string]*int64 `json:"queue"`
 	}{
 		eventResponse: toEventResponse(e),
-		Queue:         map[string]int{"size": 0},
+		Queue:         map[string]*int64{"size": queueSize},
 	})
 }

@@ -13,8 +13,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	api "github.com/vinhpnguyen123/ticketqueue/internal/http"
+	"github.com/vinhpnguyen123/ticketqueue/internal/queue"
 	"github.com/vinhpnguyen123/ticketqueue/internal/testutil"
 )
 
@@ -24,7 +26,7 @@ func newEventsServer(t *testing.T) (*httptest.Server, *pgxpool.Pool) {
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	api.NewEventsHandler(pool).Mount(r)
+	api.NewEventsHandler(pool, testutil.TestRedis(t)).Mount(r)
 
 	ts := httptest.NewServer(r)
 	t.Cleanup(ts.Close)
@@ -252,5 +254,61 @@ func TestListInvalidCursor(t *testing.T) {
 	resp := getJSON(t, ts.URL+"/v1/events?cursor=not-a-uuid", &errBody)
 	if resp.StatusCode != http.StatusUnprocessableEntity || errBody.Error.Type != "validation_failed" {
 		t.Errorf("status = %d, type = %q", resp.StatusCode, errBody.Error.Type)
+	}
+}
+
+func eventQueueSize(t *testing.T, ts *httptest.Server, eventID string) any {
+	t.Helper()
+	resp, err := http.Get(ts.URL + "/v1/events/" + eventID)
+	if err != nil {
+		t.Fatalf("get event: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var out struct {
+		Data struct {
+			Queue map[string]any `json:"queue"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	size, ok := out.Data.Queue["size"]
+	if !ok {
+		t.Fatal("queue.size missing")
+	}
+	return size
+}
+
+func TestEventDetailReportsQueueSize(t *testing.T) {
+	ts, pool := newEventsServer(t)
+	rdb := testutil.TestRedis(t)
+	eventID := seedEvent(t, pool, "Busy", "on_sale", nil)
+	for i, member := range []string{"a", "b", "c"} {
+		if err := rdb.ZAdd(context.Background(), queue.Key(eventID), redis.Z{Score: float64(i), Member: member}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := eventQueueSize(t, ts, eventID); got != float64(3) {
+		t.Errorf("queue.size = %v, want 3", got)
+	}
+}
+
+// The public page must survive Redis being down, and 0 would be a false answer.
+func TestEventDetailRedisDown(t *testing.T) {
+	pool := testutil.TestDB(t)
+	dead := redis.NewClient(&redis.Options{Addr: "localhost:1"})
+	t.Cleanup(func() { dead.Close() })
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	api.NewEventsHandler(pool, dead).Mount(r)
+	ts := httptest.NewServer(r)
+	t.Cleanup(ts.Close)
+
+	eventID := seedEvent(t, pool, "Quiet", "on_sale", nil)
+	if got := eventQueueSize(t, ts, eventID); got != nil {
+		t.Errorf("queue.size = %v, want null", got)
 	}
 }
