@@ -823,3 +823,50 @@ func TestPurchaseRetrySameKeyOneCharge(t *testing.T) {
 		t.Errorf("bookings = %d, succeeded payments = %d, want 1 and 1", bookings, payments)
 	}
 }
+
+// Requests that lose the one-held-booking race took a Layer-1 reservation on
+// the way in, and must give it back. tok_drops_response keeps the winner held.
+func TestPurchaseActiveBookingCompensatesInventory(t *testing.T) {
+	ts, pool, rdb := newPurchaseServer(t)
+	eventID, tierID := seedTier(t, pool, 1000, 50)
+	userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+	body := purchaseBodyTok(eventID, tierID, 1, purchaseTok, "tok_drops_response")
+
+	const n = 8
+	start := make(chan struct{})
+	statuses := make([]int, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, _ := purchase(t, ts, jwtTok, fmt.Sprintf("race-%d", i), body)
+			statuses[i] = resp.StatusCode
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	blocked := 0
+	for _, s := range statuses {
+		if s == http.StatusGone {
+			blocked++
+		}
+	}
+	if blocked != n-1 {
+		t.Errorf("statuses = %v, want exactly one winner and %d x 410", statuses, n-1)
+	}
+
+	var bookings int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM booking WHERE user_id = $1`, userID).Scan(&bookings); err != nil {
+		t.Fatalf("count bookings: %v", err)
+	}
+	if bookings != 1 {
+		t.Errorf("bookings = %d, want 1", bookings)
+	}
+	if got := redisInt(t, rdb, booking.InventoryKey(tierID)); got != 49 {
+		t.Errorf("redis inventory = %d, want 49", got)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -17,6 +18,11 @@ import (
 
 // ErrSoldOut means the tier has fewer available tickets than requested.
 var ErrSoldOut = errors.New("sold out")
+
+// ErrActiveBooking means the user already has a held booking. The unique index
+// idx_booking_user_active is what enforces this; ActiveBookingID is only the
+// cheap early answer, and cannot stop two requests that both read "none".
+var ErrActiveBooking = errors.New("user already has a held booking")
 
 // InventoryKey is the Redis fast-path counter for a tier's available tickets.
 func InventoryKey(tierID string) string { return "inventory:" + tierID }
@@ -155,6 +161,10 @@ func HoldTickets(ctx context.Context, pool *pgxpool.Pool, userID string, tier Ti
 		 RETURNING id`,
 		userID, tier.EventID, tier.ID, qty, idemKey, totalCents, tier.Currency,
 	).Scan(&bookingID); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "idx_booking_user_active" {
+			return Held{}, ErrActiveBooking
+		}
 		return Held{}, fmt.Errorf("insert booking: %w", err)
 	}
 
@@ -199,8 +209,10 @@ func HoldTickets(ctx context.Context, pool *pgxpool.Pool, userID string, tier Ti
 	return Held{BookingID: bookingID, TotalCents: totalCents, Currency: tier.Currency}, nil
 }
 
-// ActiveBookingID returns the user's existing held booking, if any
-// (duplicate-charge guard; uses idx_booking_user_active).
+// ActiveBookingID returns the user's existing held booking, if any. This is the
+// cheap early answer of the duplicate-charge guard, not the guarantee: the
+// unique idx_booking_user_active is, and HoldTickets reports it as
+// ErrActiveBooking.
 func ActiveBookingID(ctx context.Context, pool *pgxpool.Pool, userID string) (string, bool, error) {
 	var id string
 	err := pool.QueryRow(ctx,

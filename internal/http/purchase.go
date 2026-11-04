@@ -103,16 +103,15 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Duplicate-charge guard: one held booking per user at a time.
+	// Duplicate-charge guard: one held booking per user at a time. This read is
+	// the cheap path; the unique index behind ErrActiveBooking below is what
+	// stops two requests that both read "none".
 	if existing, found, err := booking.ActiveBookingID(r.Context(), h.pool, userID); err != nil {
 		slog.Error("purchase: active booking lookup", "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to process purchase")
 		return
 	} else if found {
-		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeDuplicateBlocked).Inc()
-		response.ErrorWithDetails(w, r, http.StatusGone, "active_booking_exists",
-			"you already have a booking in progress",
-			map[string]any{"booking_id": existing})
+		respondActiveBooking(w, r, existing)
 		return
 	}
 
@@ -168,6 +167,16 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, booking.ErrSoldOut) {
 			metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeSoldOut).Inc()
 			response.Error(w, r, http.StatusConflict, "sold_out", "not enough tickets available")
+			return
+		}
+		if errors.Is(err, booking.ErrActiveBooking) {
+			// The winner of the race committed before this INSERT failed. If the
+			// lookup misses, it has already been resolved; the answer stands.
+			existing, _, lerr := booking.ActiveBookingID(r.Context(), h.pool, userID)
+			if lerr != nil {
+				slog.Error("purchase: active booking lookup", "error", lerr)
+			}
+			respondActiveBooking(w, r, existing)
 			return
 		}
 		slog.Error("purchase: TX1 failed", "error", err)
@@ -233,6 +242,13 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		slog.Error("purchase: unknown finalize status", "status", fin.Status, "booking_id", held.BookingID)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to finalize purchase")
 	}
+}
+
+func respondActiveBooking(w http.ResponseWriter, r *http.Request, bookingID string) {
+	metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeDuplicateBlocked).Inc()
+	response.ErrorWithDetails(w, r, http.StatusGone, "active_booking_exists",
+		"you already have a booking in progress",
+		map[string]any{"booking_id": bookingID})
 }
 
 // reference is the human-facing booking reference derived from the booking id.
