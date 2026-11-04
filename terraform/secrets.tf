@@ -3,11 +3,9 @@
 # least this one was never typed by a human and never reused anywhere else.
 resource "random_password" "db" {
   length = 32
-  # RDS rejects '/', '@', '"' and space in a master password, and the value is
-  # also embedded in a postgres:// URL where those characters would need
-  # escaping.
-  special          = true
-  override_special = "!#$%&*()-_=+[]{}<>:?"
+  # Alphanumeric only: the value is embedded unescaped in postgres:// URLs, where
+  # characters like #, %, ? and [ break parsing or change what the URL means.
+  special = false
 }
 
 resource "random_password" "jwt" {
