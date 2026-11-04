@@ -325,7 +325,7 @@ func newLiveStack(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Client)
 	pc.HTTP.Timeout = 1 * time.Second
 	payClient = pc
 
-	api.NewAuthHandler(pool, rdb, testSecret).Mount(r)
+	api.NewAuthHandler(pool, rdb, testSecret, 0).Mount(r)
 	api.NewPurchaseHandler(pool, rdb, testSecret, pc).Mount(r)
 	api.NewWebhookHandler(pool, rdb, webhookSecret, pc).Mount(r)
 	return ts, pool, rdb

@@ -165,6 +165,8 @@ resource "aws_ecs_task_definition" "api" {
         { name = "POOL_MAX_CONNS", value = "25" },
         { name = "REDIS_ADDR", value = "${aws_elasticache_cluster.main.cache_nodes[0].address}:6379" },
         { name = "PAYMENT_URL", value = local.payment_url },
+        # The ALB is the one proxy in front of the API.
+        { name = "TRUSTED_PROXY_HOPS", value = "1" },
       ]
 
       secrets = [

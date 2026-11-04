@@ -52,7 +52,7 @@ func newPurchaseServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Cl
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	api.NewAuthHandler(pool, rdb, testSecret).Mount(r)
+	api.NewAuthHandler(pool, rdb, testSecret, 0).Mount(r)
 	api.NewPurchaseHandler(pool, rdb, testSecret, pc).Mount(r)
 	ts := httptest.NewServer(r)
 	t.Cleanup(ts.Close)

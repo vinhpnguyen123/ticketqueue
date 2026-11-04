@@ -5,6 +5,7 @@ package http_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"testing"
@@ -98,5 +99,18 @@ func TestRateLimitBucketsAreIndependent(t *testing.T) {
 	// A different IP still gets through.
 	if resp := postLoginFrom(t, ts.URL, "198.51.100.4"); resp.StatusCode == http.StatusTooManyRequests {
 		t.Fatal("different IP shares the exhausted bucket")
+	}
+}
+
+// Rotating the part of the header a client controls must not earn fresh buckets.
+func TestForgedForwardedForSharesBucket(t *testing.T) {
+	waitOutWindowBoundary(t)
+	ts, _ := newTestServer(t)
+	var last *http.Response
+	for i := range 7 {
+		last = postLoginFrom(t, ts.URL, fmt.Sprintf("203.0.113.%d, 198.51.100.77", i))
+	}
+	if last.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429 despite the rotating forged entry", last.StatusCode)
 	}
 }

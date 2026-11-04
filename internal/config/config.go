@@ -1,7 +1,11 @@
 // Package config loads application configuration from environment variables.
 package config
 
-import "os"
+import (
+	"fmt"
+	"os"
+	"strconv"
+)
 
 // Config holds all runtime configuration for ticketqueue services.
 type Config struct {
@@ -18,6 +22,9 @@ type Config struct {
 	// unsigned webhooks are worse than no webhooks, and reconciliation already
 	// covers everything the webhook does.
 	WebhookSecret string
+	// TrustedProxyHops is how many proxies in front of the API append to
+	// X-Forwarded-For: 0 when clients connect directly, 1 behind the ALB.
+	TrustedProxyHops int
 }
 
 // Load reads configuration from the environment, applying local-dev
@@ -35,6 +42,11 @@ func Load() (Config, error) {
 		MetricsPort:   getenv("METRICS_PORT", "9091"),
 		WebhookSecret: getenv("WEBHOOK_SECRET", "whsec_localdev"),
 	}
+	hops, err := strconv.Atoi(getenv("TRUSTED_PROXY_HOPS", "0"))
+	if err != nil || hops < 0 {
+		return Config{}, fmt.Errorf("TRUSTED_PROXY_HOPS must be a non-negative integer")
+	}
+	cfg.TrustedProxyHops = hops
 	return cfg, nil
 }
 

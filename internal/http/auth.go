@@ -38,21 +38,22 @@ var fakeHash = func() string {
 
 // AuthHandler serves /v1/auth/* and /v1/me.
 type AuthHandler struct {
-	users  *user.Repo
-	pool   *pgxpool.Pool
-	rdb    *redis.Client
-	secret string
+	users       *user.Repo
+	pool        *pgxpool.Pool
+	rdb         *redis.Client
+	secret      string
+	trustedHops int
 }
 
-func NewAuthHandler(pool *pgxpool.Pool, rdb *redis.Client, secret string) *AuthHandler {
-	return &AuthHandler{users: user.NewRepo(pool), pool: pool, rdb: rdb, secret: secret}
+func NewAuthHandler(pool *pgxpool.Pool, rdb *redis.Client, secret string, trustedHops int) *AuthHandler {
+	return &AuthHandler{users: user.NewRepo(pool), pool: pool, rdb: rdb, secret: secret, trustedHops: trustedHops}
 }
 
 // Mount registers the auth routes on r; /v1/me goes behind the JWT middleware.
 func (h *AuthHandler) Mount(r chi.Router) {
-	r.With(ratelimit.Limit(h.rdb, "register", 3, ratelimit.ByIP)).
+	r.With(ratelimit.Limit(h.rdb, "register", 3, ratelimit.ByClientIP(h.trustedHops))).
 		Post("/v1/auth/register", h.Register)
-	r.With(ratelimit.Limit(h.rdb, "login", 5, ratelimit.ByIP)).
+	r.With(ratelimit.Limit(h.rdb, "login", 5, ratelimit.ByClientIP(h.trustedHops))).
 		Post("/v1/auth/login", h.Login)
 	r.Group(func(r chi.Router) {
 		r.Use(auth.Middleware(h.secret))
