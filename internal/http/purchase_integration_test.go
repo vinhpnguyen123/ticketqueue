@@ -927,3 +927,27 @@ func TestPurchaseAllowedInsideSaleWindow(t *testing.T) {
 		t.Fatalf("status = %d body=%v, want 201", resp.StatusCode, out)
 	}
 }
+
+// 2^62 x 4 wraps int64 to exactly zero, which satisfies total_cents >= 0 and
+// would confirm the booking for free.
+func TestPurchaseRejectsTotalOverflow(t *testing.T) {
+	ts, pool, rdb := newPurchaseServer(t)
+	ctx := context.Background()
+	eventID, tierID := seedTier(t, pool, 4611686018427387904, 5)
+	userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+
+	resp, out := purchase(t, ts, jwtTok, "overflow-key", purchaseBody(eventID, tierID, 4, purchaseTok))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d body=%v, want 422", resp.StatusCode, out)
+	}
+	var bookings int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM booking WHERE user_id = $1`, userID).Scan(&bookings); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if bookings != 0 {
+		t.Errorf("bookings = %d, want 0", bookings)
+	}
+	if n, _ := rdb.Exists(ctx, booking.InventoryKey(tierID)).Result(); n != 0 {
+		t.Errorf("inventory was touched before the overflow check")
+	}
+}

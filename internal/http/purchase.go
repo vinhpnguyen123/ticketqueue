@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -134,6 +135,14 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// A purchase token proves queue admission, which can outlive the sale.
 	if !tier.OnSale {
 		response.Error(w, r, http.StatusGone, "sales_closed", "ticket sales are not open for this tier")
+		return
+	}
+
+	// An overflowed total can wrap to zero, which the schema's >= 0 check accepts.
+	if tier.PriceCents > math.MaxInt64/int64(req.Quantity) {
+		response.ErrorWithDetails(w, r, http.StatusUnprocessableEntity,
+			"validation_failed", "invalid purchase request",
+			map[string]any{"quantity": "total price is out of range"})
 		return
 	}
 
