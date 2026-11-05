@@ -44,8 +44,10 @@ jobs:
         run: go vet -tags=integration ./...
       - name: build
         run: go build ./...
-      - name: verify_run selftest
-        run: bash scripts/verify_run_selftest.sh
+      - name: script selftests
+        run: |
+          bash scripts/verify_run_selftest.sh
+          bash scripts/tf_migrate_selftest.sh
       - name: unit tests
         run: make test
       - name: migrate test database

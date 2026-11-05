@@ -95,7 +95,8 @@ make docker-push                  # 2. build ARM64 images, push to ECR
                                   #    MUST be before apply: services pull on start
 make tf-plan                      # 3. read it
 make tf-apply                     # 4. ~12 min, RDS is the slow part
-make tf-migrate                   # 5. schema, as a one-shot ECS task
+make tf-migrate                   # 5. schema, as a one-shot ECS task; exits
+                                  #    non-zero if the migration fails
 curl http://$(terraform -chdir=terraform output -raw alb_dns_name)/v1/health
                                   # 6. should return the git SHA you pushed
 curl -i http://$(terraform -chdir=terraform output -raw alb_dns_name)/metrics
@@ -113,6 +114,31 @@ tokens with it and refuses to start without one. Read it from Secrets Manager.
 Step 2 before step 4 is not optional. ECR repositories are created by
 `tf-apply`, so the very first run is a chicken-and-egg: apply once (services
 will fail to pull), then push, then apply again. After that, push first.
+
+## If a migration fails
+
+Do not continue the deploy. The app starts without complaint on an old schema, but
+migrations 15 and 16 hold the unique indexes behind two money rules: one provider
+key per booking, and one held booking per user.
+
+A fresh RDS instance cannot fail them. On a database with existing rows, run these
+first. Both must return nothing:
+
+```sql
+SELECT idempotency_key FROM booking GROUP BY 1 HAVING COUNT(*) > 1;
+SELECT user_id FROM booking WHERE status = 'held' GROUP BY 1 HAVING COUNT(*) > 1;
+```
+
+A failed migration rolls back but leaves `schema_migrations` marked dirty, and
+every later run then refuses to start. Fix the data, then clear the flag by setting
+the version to the last one that applied, and run again:
+
+```bash
+make tf-migrate CMD="force 14"    # 14 if migration 15 failed, 15 if 16 failed
+make tf-migrate
+```
+
+Never delete rows just to make an index build: those rows may be real bookings.
 
 ## Deliberate choices, and what production would do instead
 

@@ -177,14 +177,10 @@ docker-push: docker-build
 	echo; echo "pushed at tag $(GIT_SHA)"
 
 # Schema, as a one-shot task. Never from API startup: two API tasks booting at
-# once would race on the migration table.
+# once would race on the migration table. Waits and fails if the migration does.
+# CMD overrides `up`, for recovery: make tf-migrate CMD="force 14"
 tf-migrate:
-	@set -e; \
-	aws ecs run-task --cluster $(CLUSTER) --launch-type FARGATE \
-	  --task-definition ticketqueue-migrate \
-	  --network-configuration "awsvpcConfiguration={subnets=[$$(aws ec2 describe-subnets --region $(REGION) --filters Name=tag:Project,Values=ticketqueue --query 'Subnets[0].SubnetId' --output text)],securityGroups=[$$(aws ec2 describe-security-groups --region $(REGION) --filters Name=group-name,Values=ticketqueue-migrate --query 'SecurityGroups[0].GroupId' --output text)],assignPublicIp=ENABLED}" \
-	  --region $(REGION) --query 'tasks[0].taskArn' --output text
-	@echo "watch it with: aws logs tail /ecs/ticketqueue/migrate --follow --region $(REGION)"
+	@CLUSTER=$(CLUSTER) REGION=$(REGION) bash scripts/tf_migrate.sh $(CMD)
 
 tf-seed:
 	@echo "Seeding runs from the load generator, which is inside the VPC."
