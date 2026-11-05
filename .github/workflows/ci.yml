@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TEST_DATABASE_URL: postgres://ticketqueue:localdev@localhost:5434/ticketqueue_test?sslmode=disable
+      TEST_REDIS_ADDR: localhost:6379
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: ticketqueue
+          POSTGRES_PASSWORD: localdev
+          POSTGRES_DB: ticketqueue_test
+        ports: ["5434:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ticketqueue"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        run: go vet -tags=integration ./...
+      - name: build
+        run: go build ./...
+      - name: script selftests
+        run: |
+          bash scripts/verify_run_selftest.sh
+          bash scripts/tf_migrate_selftest.sh
+      - name: unit tests
+        run: make test
+      - name: migrate test database
+        run: go run -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@v4.18.1 -path migrations -database "$TEST_DATABASE_URL" up
+      - name: integration tests
+        run: make test-integration
+
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform fmt -check
+      - run: terraform init -backend=false
+      - run: terraform validate

@@ -1,9 +1,11 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -72,6 +74,9 @@ func (req *purchaseRequest) validate() map[string]any {
 	return problems
 }
 
+// finishTimeout bounds the charge and TX2 once the request context may be gone.
+const finishTimeout = 15 * time.Second
+
 func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	userID, ok := auth.UserIDFromContext(r.Context())
 	if !ok {
@@ -81,6 +86,9 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	var req purchaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if response.BodyTooLarge(w, r, err) {
+			return
+		}
 		response.Error(w, r, http.StatusUnprocessableEntity, "validation_failed", "malformed JSON body")
 		return
 	}
@@ -103,16 +111,15 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Duplicate-charge guard: one held booking per user at a time.
+	// Duplicate-charge guard: one held booking per user at a time. This read is
+	// the cheap path; the unique index behind ErrActiveBooking below is what
+	// stops two requests that both read "none".
 	if existing, found, err := booking.ActiveBookingID(r.Context(), h.pool, userID); err != nil {
 		slog.Error("purchase: active booking lookup", "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to process purchase")
 		return
 	} else if found {
-		metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeDuplicateBlocked).Inc()
-		response.ErrorWithDetails(w, r, http.StatusGone, "active_booking_exists",
-			"you already have a booking in progress",
-			map[string]any{"booking_id": existing})
+		respondActiveBooking(w, r, existing)
 		return
 	}
 
@@ -132,6 +139,19 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"tier_id": "does not belong to event_id"})
 		return
 	}
+	// A purchase token proves queue admission, which can outlive the sale.
+	if !tier.OnSale {
+		response.Error(w, r, http.StatusGone, "sales_closed", "ticket sales are not open for this tier")
+		return
+	}
+
+	// An overflowed total can wrap to zero, which the schema's >= 0 check accepts.
+	if tier.PriceCents > math.MaxInt64/int64(req.Quantity) {
+		response.ErrorWithDetails(w, r, http.StatusUnprocessableEntity,
+			"validation_failed", "invalid purchase request",
+			map[string]any{"quantity": "total price is out of range"})
+		return
+	}
 
 	// Layer 1: Redis fast reject.
 	if err := booking.ReserveInventory(r.Context(), h.rdb, h.pool, tier.ID, req.Quantity); errors.Is(err, booking.ErrSoldOut) {
@@ -145,12 +165,18 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// TX1: Layers 2 and 3.
-	idemKey := r.Header.Get("Idempotency-Key")
+	//
+	// The provider's ledger is global, but a client's Idempotency-Key is only
+	// unique per user, so it must never reach the provider: a second user
+	// reusing a key would be handed the first user's charge. One key per
+	// booking is enough, because a retry never gets here — the idempotency
+	// middleware replays or rejects it first.
+	providerKey := uuid.NewString()
 	// Timings wrap the call and are recorded after it returns, so no
 	// instrumentation ever runs while a row lock is held (§11a).
 	tx1Start := time.Now()
 	held, err := booking.HoldTickets(r.Context(), h.pool, userID, tier, req.Quantity,
-		idemKey, middleware.GetReqID(r.Context()))
+		providerKey, middleware.GetReqID(r.Context()))
 	metrics.PurchasePhase.WithLabelValues(metrics.PhaseTX1).Observe(time.Since(tx1Start).Seconds())
 	if err != nil {
 		// TX1 rolled back but Layer 1 already decremented: give it back.
@@ -164,6 +190,16 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 			response.Error(w, r, http.StatusConflict, "sold_out", "not enough tickets available")
 			return
 		}
+		if errors.Is(err, booking.ErrActiveBooking) {
+			// The winner of the race committed before this INSERT failed. If the
+			// lookup misses, it has already been resolved; the answer stands.
+			existing, _, lerr := booking.ActiveBookingID(r.Context(), h.pool, userID)
+			if lerr != nil {
+				slog.Error("purchase: active booking lookup", "error", lerr)
+			}
+			respondActiveBooking(w, r, existing)
+			return
+		}
 		slog.Error("purchase: TX1 failed", "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to process purchase")
 		return
@@ -171,17 +207,22 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	idempotency.SetBookingID(r, held.BookingID)
 	// --- End PHASE 1 (TX1). All row locks released at COMMIT above. ---
 
+	// From here the booking exists and a charge may land, so a client giving up
+	// must not abandon the attempt halfway. The charge has its own 3s timeout.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), finishTimeout)
+	defer cancel()
+
 	// --- PHASE 2: the payment call. NO DB transaction is open here — we never
 	// hold locks across a network call. Charge classifies every outcome
 	// (succeeded / declined / ambiguous) so PHASE 3 branches in one place.
 	payStart := time.Now()
-	charge := h.payments.Charge(r.Context(), idemKey, held.TotalCents, held.Currency, req.PaymentToken)
+	charge := h.payments.Charge(ctx, providerKey, held.TotalCents, held.Currency, req.PaymentToken)
 	metrics.PurchasePhase.WithLabelValues(metrics.PhasePaymentCall).Observe(time.Since(payStart).Seconds())
 
 	// --- PHASE 3: TX2 finalization based on the payment outcome.
-	reqID := middleware.GetReqID(r.Context())
+	reqID := middleware.GetReqID(ctx)
 	tx2Start := time.Now()
-	fin, err := booking.Finalize(r.Context(), h.pool, held, tier.ID, userID, reqID, charge)
+	fin, err := booking.Finalize(ctx, h.pool, held, tier.ID, userID, reqID, charge)
 	metrics.PurchasePhase.WithLabelValues(metrics.PhaseTX2).Observe(time.Since(tx2Start).Seconds())
 	if err != nil {
 		slog.Error("purchase: TX2 finalize failed", "booking_id", held.BookingID, "error", err)
@@ -204,7 +245,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		// commit, never inside the transaction. ReleaseQty is 0 when the expiry
 		// worker already compensated (the lost-guard race).
 		if fin.ReleaseQty > 0 {
-			if cerr := booking.CompensateInventory(r.Context(), h.rdb, tier.ID, fin.ReleaseQty); cerr != nil {
+			if cerr := booking.CompensateInventory(ctx, h.rdb, tier.ID, fin.ReleaseQty); cerr != nil {
 				slog.Error("purchase: decline inventory compensation failed (drift checker will heal)",
 					"tier_id", tier.ID, "qty", fin.ReleaseQty, "error", cerr)
 			}
@@ -227,6 +268,13 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		slog.Error("purchase: unknown finalize status", "status", fin.Status, "booking_id", held.BookingID)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to finalize purchase")
 	}
+}
+
+func respondActiveBooking(w http.ResponseWriter, r *http.Request, bookingID string) {
+	metrics.PurchaseOutcome.WithLabelValues(metrics.OutcomeDuplicateBlocked).Inc()
+	response.ErrorWithDetails(w, r, http.StatusGone, "active_booking_exists",
+		"you already have a booking in progress",
+		map[string]any{"booking_id": bookingID})
 }
 
 // reference is the human-facing booking reference derived from the booking id.

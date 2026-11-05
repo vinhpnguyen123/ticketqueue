@@ -1,0 +1,63 @@
+[1mchaos1-api-kill[0m  2026-11-05T02:16:37Z
+  [2mVUs=500  output=/Users/vinhnguyen/ticketqueue/docs/chaos/chaos1-api-kill-20261104T211637.txt[0m
+  [2mbuilding into /var/folders/rv/vqlccvrx6mj_rtbdjc5v1b2r0000gn/T//ticketqueue-chaos-57307[0m
+
+[1m▸ Start the world[0m
+  [2mpayments started (pid 57708)[0m
+  [2mworker started (pid 57709)[0m
+  [2mseeding: 40000 tickets, 500 users[0m
+  [2mtier 9fb11e95-8d86-4af3-8226-06e47c89f625[0m
+  [2mapi started (pid 57779)[0m
+  [2mapi up on 8081[0m
+
+[1m▸ Load: 500 VUs, 90s, sustained[0m
+
+[1m▸ KILL the API 30s in[0m
+  [2mapi KILLED (pid 57779)[0m
+  [33m8 bookings stranded in 'held' with tickets locked to them[0m
+  [2mconfirmed before the crash: 6966[0m
+
+[1m▸ Restart the API[0m
+  [2mapi started (pid 58143)[0m
+  [2mwaiting for the load to finish[0m
+      purchase_outcomes..............: 121850 1326.434957/s
+      http_req_failed................: 83.25% 101450 out of 121850
+      iterations.....................: 121850 1326.434957/s
+
+[1m▸ Recovery[0m
+  [2mbooking.StuckAfter=90s, ReconcileInterval=30s — nothing is even eligible[0m
+  [2mfor 90s, so recovery is 90-120s by construction, not 'two cycles'[0m
+  [2mReconcileBatch=50/cycle → a backlog drains at ~100 bookings/minute[0m
+  [32mPASS[0m  all 8 stranded bookings resolved 117s after the kill
+
+[1m▸ Assertions[0m
+  [32mPASS[0m  zero bookings left 'held' on this tier (0)
+  [32mPASS[0m  zero bookings held longer than 5 minutes (verify_run check 8) (0)
+  [32mPASS[0m  reconciliation_resolution_total{source=reconciliation} rose with the stranded count (8 >= 4)
+
+[1m▸ Money correctness (scripts/verify_run.sql)[0m
+  [32mPASS[0m  all nine checks green
+     PASS   |                  0
+     PASS   |              0
+     PASS   |       116696 |        116696
+     PASS   |            0
+     PASS   |                0
+     PASS   |   5834800000 |    5834800000
+     PASS   |         0
+     PASS   |           0
+     PASS   |           0
+     PASS   |              0
+
+[1m▸ RESULT[0m
+  [1m8 bookings stranded by the crash, all 8 resolved 117s after it, zero money discrepancies.[0m
+  [2mk6 detail: /Users/vinhnguyen/ticketqueue/docs/chaos/chaos1-api-kill-20261104T211637-k6.txt[0m
+
+[1m▸ Grafana, this run's window[0m
+  http://localhost:3000/d/ticketqueue/ticketqueue?from=1793844967000&to=1793845227000
+  [2mRow 2 (Latency breakdown) shows where time went while the API was dead.[0m
+
+[1m▸ VERDICT[0m
+  [32m[1mchaos1-api-kill PASSED[0m — /Users/vinhnguyen/ticketqueue/docs/chaos/chaos1-api-kill-20261104T211637.txt
+scripts/chaos/lib.sh: line 112: 57708 Killed: 9               PAYMENT_PORT="$PAYMENT_PORT" nohup "$BUILD_DIR/payment-service" > "$BUILD_DIR/payments.log" 2>&1
+scripts/chaos/lib.sh: line 112: 57709 Killed: 9               PAYMENT_URL="$PAYMENT_URL" METRICS_PORT="$WORKER_METRICS_PORT" nohup "$BUILD_DIR/worker" > "$BUILD_DIR/worker.log" 2>&1
+scripts/chaos/lib.sh: line 112: 58143 Killed: 9               PORT="$API_PORT" PAYMENT_URL="$PAYMENT_URL" nohup "$BUILD_DIR/api" > "$BUILD_DIR/api.log" 2>&1

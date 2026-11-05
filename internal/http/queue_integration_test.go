@@ -30,7 +30,7 @@ func newQueueServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Clien
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	api.NewAuthHandler(pool, rdb, testSecret).Mount(r)
+	api.NewAuthHandler(pool, rdb, testSecret, 0).Mount(r)
 	api.NewQueueHandler(pool, rdb, testSecret).Mount(r)
 
 	ts := httptest.NewServer(r)
@@ -238,5 +238,200 @@ func TestQueuePositionAdmitted(t *testing.T) {
 	}
 	if claims.Subject != userID {
 		t.Errorf("purchase token sub = %q, want %q", claims.Subject, userID)
+	}
+}
+
+// A rejoin must not put an admitted user back in the waiting set: position would
+// report "waiting" and hide the token while their window runs out.
+func TestRejoinWhileAdmittedKeepsToken(t *testing.T) {
+	ts, pool, rdb := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	userID, tok := registerUser(t, ts, "rejoin@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	ctx := context.Background()
+
+	doQueue(t, http.MethodPost, base+"/join", tok, nil)
+	if _, err := pool.Exec(ctx,
+		`UPDATE queue_entries SET status = 'admitted', admitted_at = NOW()
+		 WHERE user_id = $1 AND event_id = $2`, userID, eventID); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+	if err := rdb.ZRem(ctx, queue.Key(eventID), userID).Err(); err != nil {
+		t.Fatalf("zrem: %v", err)
+	}
+	var original queuePositionBody
+	doQueue(t, http.MethodGet, base+"/position", tok, &original)
+
+	var rejoin queuePositionBody
+	resp := doQueue(t, http.MethodPost, base+"/join", tok, &rejoin)
+	if resp.StatusCode != http.StatusOK || rejoin.Data.Status != "admitted" || rejoin.Data.PurchaseToken == "" {
+		t.Fatalf("rejoin status=%d body=%+v, want 200 admitted with a token", resp.StatusCode, rejoin.Data)
+	}
+	if !rejoin.Data.WindowExpiresAt.Equal(original.Data.WindowExpiresAt) {
+		t.Errorf("window moved: %v, was %v", rejoin.Data.WindowExpiresAt, original.Data.WindowExpiresAt)
+	}
+	if n, err := rdb.ZCard(ctx, queue.Key(eventID)).Result(); err != nil || n != 0 {
+		t.Errorf("waiting set size = %d, err = %v, want 0", n, err)
+	}
+
+	var pos queuePositionBody
+	doQueue(t, http.MethodGet, base+"/position", tok, &pos)
+	if pos.Data.Status != "admitted" || pos.Data.PurchaseToken == "" {
+		t.Errorf("position after rejoin = %+v, want admitted with a token", pos.Data)
+	}
+}
+
+// admitDirect commits an admission without touching Redis: what a worker crash
+// or a failed ZREM leaves behind.
+func admitDirect(t *testing.T, pool *pgxpool.Pool, userID, eventID string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE queue_entries SET status = 'admitted', admitted_at = NOW()
+		 WHERE user_id = $1 AND event_id = $2`, userID, eventID); err != nil {
+		t.Fatalf("admit: %v", err)
+	}
+}
+
+func TestPositionFindsAdmissionBehindStaleRedisMember(t *testing.T) {
+	ts, pool, _ := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	userID, tok := registerUser(t, ts, "stale@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	doQueue(t, http.MethodPost, base+"/join", tok, nil)
+	admitDirect(t, pool, userID, eventID)
+
+	var pos queuePositionBody
+	resp := doQueue(t, http.MethodGet, base+"/position", tok, &pos)
+	if resp.StatusCode != http.StatusOK || pos.Data.Status != "admitted" || pos.Data.PurchaseToken == "" {
+		t.Fatalf("status=%d body=%+v, want admitted with a token", resp.StatusCode, pos.Data)
+	}
+}
+
+func TestPositionWaitingUserAtFrontKeepsRank(t *testing.T) {
+	ts, pool, _ := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	_, tok := registerUser(t, ts, "front@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	doQueue(t, http.MethodPost, base+"/join", tok, nil)
+
+	var pos queuePositionBody
+	resp := doQueue(t, http.MethodGet, base+"/position", tok, &pos)
+	if resp.StatusCode != http.StatusOK || pos.Data.Status != "waiting" || pos.Data.Position != 1 || pos.Data.QueueSize != 1 {
+		t.Fatalf("status=%d body=%+v, want waiting at position 1 of 1", resp.StatusCode, pos.Data)
+	}
+}
+
+// Promotion keeps running without Redis, so tokens must stay reachable too.
+func TestPositionRedisDownAnswersFromPostgres(t *testing.T) {
+	ts, pool, _ := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	admittedID, admittedTok := registerUser(t, ts, "down-admitted@test.dev")
+	_, waitingTok := registerUser(t, ts, "down-waiting@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	doQueue(t, http.MethodPost, base+"/join", admittedTok, nil)
+	doQueue(t, http.MethodPost, base+"/join", waitingTok, nil)
+	admitDirect(t, pool, admittedID, eventID)
+
+	dead := redis.NewClient(&redis.Options{Addr: "localhost:1"})
+	t.Cleanup(func() { dead.Close() })
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	api.NewQueueHandler(pool, dead, testSecret).Mount(r)
+	down := httptest.NewServer(r)
+	t.Cleanup(down.Close)
+	deadBase := fmt.Sprintf("%s/v1/events/%s/queue", down.URL, eventID)
+
+	var admitted queuePositionBody
+	resp := doQueue(t, http.MethodGet, deadBase+"/position", admittedTok, &admitted)
+	if resp.StatusCode != http.StatusOK || admitted.Data.Status != "admitted" || admitted.Data.PurchaseToken == "" {
+		t.Errorf("admitted user: status=%d body=%+v", resp.StatusCode, admitted.Data)
+	}
+	var waiting queuePositionBody
+	resp = doQueue(t, http.MethodGet, deadBase+"/position", waitingTok, &waiting)
+	if resp.StatusCode != http.StatusOK || waiting.Data.Status != "waiting" {
+		t.Errorf("waiting user: status=%d body=%+v", resp.StatusCode, waiting.Data)
+	}
+}
+
+// Between a Redis loss and the next sync, a waiting user is still in the queue.
+func TestPositionWaitingAfterRedisFlush(t *testing.T) {
+	ts, pool, rdb := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	_, tok := registerUser(t, ts, "flushed@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	doQueue(t, http.MethodPost, base+"/join", tok, nil)
+	if err := rdb.Del(context.Background(), queue.Key(eventID)).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	var pos queuePositionBody
+	resp := doQueue(t, http.MethodGet, base+"/position", tok, &pos)
+	if resp.StatusCode != http.StatusOK || pos.Data.Status != "waiting" {
+		t.Fatalf("status=%d body=%+v, want 200 waiting", resp.StatusCode, pos.Data)
+	}
+}
+
+func TestPositionStaleMemberOfDepartedUserIsNotFound(t *testing.T) {
+	ts, pool, _ := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	userID, tok := registerUser(t, ts, "gone@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	doQueue(t, http.MethodPost, base+"/join", tok, nil)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE queue_entries SET status = 'left', left_at = NOW() WHERE user_id = $1`, userID); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doQueue(t, http.MethodGet, base+"/position", tok, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestQueueJoinRedisDownReportsNullPosition(t *testing.T) {
+	ts, pool, _ := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	_, tok := registerUser(t, ts, "join-down@test.dev")
+
+	dead := redis.NewClient(&redis.Options{Addr: "localhost:1"})
+	t.Cleanup(func() { dead.Close() })
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	api.NewQueueHandler(pool, dead, testSecret).Mount(r)
+	down := httptest.NewServer(r)
+	t.Cleanup(down.Close)
+
+	var out struct {
+		Data map[string]any `json:"data"`
+	}
+	resp := doQueue(t, http.MethodPost, fmt.Sprintf("%s/v1/events/%s/queue/join", down.URL, eventID), tok, &out)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d body=%v, want 201", resp.StatusCode, out.Data)
+	}
+	if out.Data["position"] != nil || out.Data["queue_size"] != nil {
+		t.Errorf("body = %v, want null position and queue_size", out.Data)
+	}
+}
+
+// Every poll already reads Postgres to load the event, so the durable check has
+// no reason to stop at the front of the queue.
+func TestPositionFindsAdmissionDeepInStaleSet(t *testing.T) {
+	ts, pool, _ := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE events SET max_concurrent_windows = 1 WHERE id = $1`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	_, firstTok := registerUser(t, ts, "deep-first@test.dev")
+	secondID, secondTok := registerUser(t, ts, "deep-second@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	doQueue(t, http.MethodPost, base+"/join", firstTok, nil)
+	doQueue(t, http.MethodPost, base+"/join", secondTok, nil)
+	admitDirect(t, pool, secondID, eventID)
+
+	var pos queuePositionBody
+	resp := doQueue(t, http.MethodGet, base+"/position", secondTok, &pos)
+	if resp.StatusCode != http.StatusOK || pos.Data.Status != "admitted" || pos.Data.PurchaseToken == "" {
+		t.Fatalf("status=%d body=%+v, want admitted with a token", resp.StatusCode, pos.Data)
 	}
 }

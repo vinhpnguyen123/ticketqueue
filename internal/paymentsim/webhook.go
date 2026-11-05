@@ -83,7 +83,7 @@ func (s *server) notify(ch charge) {
 
 func (s *server) deliver(body []byte) {
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	sig := Sign(body, s.webhookSecret)
+	sig := Sign(ts, body, s.webhookSecret)
 
 	backoff := 100 * time.Millisecond
 	for attempt := 1; attempt <= webhookRetries; attempt++ {
@@ -114,11 +114,14 @@ func (s *server) deliver(body []byte) {
 	slog.Error("webhook delivery gave up; reconciliation will resolve the booking")
 }
 
-// Sign produces the X-Webhook-Signature value for a raw body. Exported so the
+// Sign produces the X-Webhook-Signature value for a delivery. It covers the
+// timestamp as well as the body, so the freshness check cannot be defeated by
+// putting a new timestamp on a captured delivery. Exported so the
 // receiver's tests can build a genuinely valid signature instead of copying the
 // algorithm and drifting from it.
-func Sign(body []byte, secret string) string {
+func Sign(ts string, body []byte, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(ts + "."))
 	mac.Write(body)
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }

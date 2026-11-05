@@ -27,6 +27,9 @@ import (
 // Older than this and the original attempt is presumed dead.
 const lockTimeout = 30 * time.Second
 
+// persistTimeout bounds storing the outcome once the request context is gone.
+const persistTimeout = 5 * time.Second
+
 type ctxKey int
 
 const bookingIDKey ctxKey = iota
@@ -84,6 +87,9 @@ func Middleware(pool *pgxpool.Pool) func(http.Handler) http.Handler {
 
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
+				if response.BodyTooLarge(w, r, err) {
+					return
+				}
 				response.Error(w, r, http.StatusBadRequest, "invalid_request", "cannot read request body")
 				return
 			}
@@ -131,7 +137,11 @@ func Middleware(pool *pgxpool.Pool) func(http.Handler) http.Handler {
 				slog.Error("idempotency response body encode failed", "error", encErr)
 				return
 			}
-			if _, err := pool.Exec(ctx,
+			// Not the request context: a client that gave up is the likeliest one
+			// to retry, and its retry needs this row completed to get a replay.
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+			defer cancel()
+			if _, err := pool.Exec(persistCtx,
 				`UPDATE idempotency_keys
 				 SET response_status = $3, response_body = $4::jsonb, booking_id = $5, completed_at = NOW()
 				 WHERE key = $1 AND user_id = $2`,

@@ -228,7 +228,7 @@ func (h *BookingsHandler) syncReconcile(r *http.Request, current booking.Detail,
 		slog.Error("bookings: sync reconcile", "booking_id", current.ID, "error", err)
 		return current
 	}
-	if res.Provider == booking.ProviderUnreachable {
+	if res.Provider == booking.ProviderUnreachable || res.Provider == booking.ProviderInFlight {
 		return current // still 'held'; the user sees "processing"
 	}
 

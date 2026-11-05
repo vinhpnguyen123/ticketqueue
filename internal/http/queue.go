@@ -83,17 +83,25 @@ func (h *QueueHandler) Join(w http.ResponseWriter, r *http.Request) {
 	}
 
 	position, alreadyInQueue, err := queue.Join(r.Context(), h.rdb, h.pool, userID, e.ID)
+	if errors.Is(err, queue.ErrAlreadyAdmitted) {
+		h.respondFromEntry(w, r, e, userID, nil)
+		return
+	}
 	if err != nil {
 		slog.Error("queue: join", "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to join queue")
 		return
 	}
 
-	_, size, _, err := queue.Position(r.Context(), h.rdb, userID, e.ID)
-	if err != nil {
-		slog.Error("queue: size after join", "error", err)
-		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to join queue")
-		return
+	// Null, not 0, when Redis cannot say: the join itself has succeeded.
+	var positionOut, sizeOut any
+	if position > 0 {
+		positionOut = position
+		if _, size, _, err := queue.Position(r.Context(), h.rdb, userID, e.ID); err != nil {
+			slog.Warn("queue: size after join unavailable", "error", err)
+		} else {
+			sizeOut = size
+		}
 	}
 
 	var joinedAt time.Time
@@ -112,8 +120,8 @@ func (h *QueueHandler) Join(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK // idempotent re-join is not an error
 	}
 	response.JSON(w, r, status, map[string]any{
-		"position":   position,
-		"queue_size": size,
+		"position":   positionOut,
+		"queue_size": sizeOut,
 		"joined_at":  joinedAt,
 	})
 }
@@ -129,30 +137,39 @@ func (h *QueueHandler) Position(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Redis being down is not the user's problem: promotion keeps admitting from
+	// Postgres, so a token must stay reachable. Fall through to the durable row.
 	rank, size, found, err := queue.Position(r.Context(), h.rdb, userID, e.ID)
 	if err != nil {
-		slog.Error("queue: position", "error", err)
-		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to read queue position")
-		return
+		slog.Warn("queue: position unavailable, answering from postgres", "error", err)
+		found = false
 	}
+	waiting := map[string]any{"status": "waiting", "position": nil, "queue_size": nil}
 	if found {
-		response.JSON(w, r, http.StatusOK, map[string]any{
-			"position":   rank + 1,
-			"queue_size": size,
-			"status":     "waiting",
-		})
-		return
+		waiting["position"], waiting["queue_size"] = rank+1, size
 	}
 
-	// ZRANK missed: the user may have been admitted (promotion removes the
-	// member from the waiting set but keeps the durable row as 'admitted').
+	// Redis can be behind Postgres about who was admitted: a worker crash or a
+	// failed ZREM leaves a committed admission still in the set. The durable row
+	// decides. One indexed lookup is small next to loadEvent's reads above.
+	h.respondFromEntry(w, r, e, userID, waiting)
+}
+
+// respondFromEntry answers from the durable row: the purchase token and the
+// original window for an admitted user, the waiting body for a waiting one, and
+// 404 for anyone else. A nil waiting body also answers 404.
+func (h *QueueHandler) respondFromEntry(w http.ResponseWriter, r *http.Request, e event.EventWithTiers, userID string, waiting map[string]any) {
 	var status string
 	var admittedAt *time.Time
-	err = h.pool.QueryRow(r.Context(),
+	err := h.pool.QueryRow(r.Context(),
 		`SELECT status, admitted_at FROM queue_entries
 		 WHERE user_id = $1 AND event_id = $2 AND status IN ('waiting', 'admitted')`,
 		userID, e.ID,
 	).Scan(&status, &admittedAt)
+	if err == nil && status == "waiting" && waiting != nil {
+		response.JSON(w, r, http.StatusOK, waiting)
+		return
+	}
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && status != "admitted") {
 		response.Error(w, r, http.StatusNotFound, "not_in_queue", "you are not in this event's queue")
 		return

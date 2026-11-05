@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -52,9 +53,9 @@ func newPurchaseServer(t *testing.T) (*httptest.Server, *pgxpool.Pool, *redis.Cl
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	api.NewAuthHandler(pool, rdb, testSecret).Mount(r)
+	api.NewAuthHandler(pool, rdb, testSecret, 0).Mount(r)
 	api.NewPurchaseHandler(pool, rdb, testSecret, pc).Mount(r)
-	ts := httptest.NewServer(r)
+	ts := httptest.NewServer(api.LimitBody(r))
 	t.Cleanup(ts.Close)
 	return ts, pool, rdb
 }
@@ -746,5 +747,280 @@ func TestPurchaseSiblingConfirmedFirst(t *testing.T) {
 		held.BookingID).Scan(&flags)
 	if flags != 0 {
 		t.Errorf("reconciliation_needed rows = %d, want 0 (nothing to refund)", flags)
+	}
+}
+
+// bookingCharge returns a booking's provider key and total, and the provider's
+// charge recorded under that key.
+func bookingCharge(t *testing.T, pool *pgxpool.Pool, bookingID string) (key string, totalCents int64, charge map[string]any) {
+	t.Helper()
+	if err := pool.QueryRow(context.Background(),
+		`SELECT idempotency_key, total_cents FROM booking WHERE id = $1`, bookingID,
+	).Scan(&key, &totalCents); err != nil {
+		t.Fatalf("load booking: %v", err)
+	}
+	return key, totalCents, lookupCharge(t, key)
+}
+
+// A client key is only unique per user. Reusing one across users must never
+// let the second user ride on the first user's charge.
+func TestPurchaseSameKeyTwoUsersChargedSeparately(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	cheapEvent, cheapTier := seedTier(t, pool, 1000, 5)
+	vipEvent, vipTier := seedTier(t, pool, 50000, 5)
+	_, jwtA, tokA := admittedUser(t, pool, cheapEvent, 1)
+	_, jwtB, tokB := admittedUser(t, pool, vipEvent, 2)
+
+	respA, outA := purchase(t, ts, jwtA, "shared-key", purchaseBody(cheapEvent, cheapTier, 1, tokA))
+	respB, outB := purchase(t, ts, jwtB, "shared-key", purchaseBody(vipEvent, vipTier, 1, tokB))
+	if respA.StatusCode != http.StatusCreated || respB.StatusCode != http.StatusCreated {
+		t.Fatalf("statuses = %d, %d, want 201, 201 (bodies %v, %v)", respA.StatusCode, respB.StatusCode, outA, outB)
+	}
+
+	keyA, totalA, chargeA := bookingCharge(t, pool, bookingIDOf(t, outA))
+	keyB, totalB, chargeB := bookingCharge(t, pool, bookingIDOf(t, outB))
+	if keyA == keyB {
+		t.Errorf("both bookings share provider key %q", keyA)
+	}
+	if chargeA["id"] == chargeB["id"] {
+		t.Errorf("both bookings share charge %v", chargeA["id"])
+	}
+	if got := int64(chargeA["amount"].(float64)); got != totalA {
+		t.Errorf("user A charged %d, booking total %d", got, totalA)
+	}
+	if got := int64(chargeB["amount"].(float64)); got != totalB {
+		t.Errorf("user B charged %d, booking total %d", got, totalB)
+	}
+}
+
+// The provider key is generated per booking, so a retry must never reach the
+// code that generates one.
+func TestPurchaseRetrySameKeyOneCharge(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	eventID, tierID := seedTier(t, pool, 1000, 5)
+	userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+	body := purchaseBody(eventID, tierID, 1, purchaseTok)
+
+	first, firstOut := purchase(t, ts, jwtTok, "retry-key", body)
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first status = %d body=%v", first.StatusCode, firstOut)
+	}
+	second, secondOut := purchase(t, ts, jwtTok, "retry-key", body)
+	if second.Header.Get("Idempotency-Replayed") != "true" {
+		t.Errorf("second response was not a replay: %d %v", second.StatusCode, secondOut)
+	}
+	if bookingIDOf(t, secondOut) != bookingIDOf(t, firstOut) {
+		t.Errorf("replay returned a different booking")
+	}
+
+	var bookings, payments int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(DISTINCT b.id), COUNT(p.id) FILTER (WHERE p.status = 'succeeded')
+		 FROM booking b LEFT JOIN payments p ON p.booking_id = b.id WHERE b.user_id = $1`, userID,
+	).Scan(&bookings, &payments); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if bookings != 1 || payments != 1 {
+		t.Errorf("bookings = %d, succeeded payments = %d, want 1 and 1", bookings, payments)
+	}
+}
+
+// Requests that lose the one-held-booking race took a Layer-1 reservation on
+// the way in, and must give it back. tok_drops_response keeps the winner held.
+func TestPurchaseActiveBookingCompensatesInventory(t *testing.T) {
+	ts, pool, rdb := newPurchaseServer(t)
+	eventID, tierID := seedTier(t, pool, 1000, 50)
+	userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+	body := purchaseBodyTok(eventID, tierID, 1, purchaseTok, "tok_drops_response")
+
+	const n = 8
+	start := make(chan struct{})
+	statuses := make([]int, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, _ := purchase(t, ts, jwtTok, fmt.Sprintf("race-%d", i), body)
+			statuses[i] = resp.StatusCode
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	blocked := 0
+	for _, s := range statuses {
+		if s == http.StatusGone {
+			blocked++
+		}
+	}
+	if blocked != n-1 {
+		t.Errorf("statuses = %v, want exactly one winner and %d x 410", statuses, n-1)
+	}
+
+	var bookings int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM booking WHERE user_id = $1`, userID).Scan(&bookings); err != nil {
+		t.Fatalf("count bookings: %v", err)
+	}
+	if bookings != 1 {
+		t.Errorf("bookings = %d, want 1", bookings)
+	}
+	if got := redisInt(t, rdb, booking.InventoryKey(tierID)); got != 49 {
+		t.Errorf("redis inventory = %d, want 49", got)
+	}
+}
+
+// A purchase token proves queue admission, not that the sale is still open.
+func TestPurchaseRejectedOutsideSale(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup string // $1 = event id, $2 = tier id
+	}{
+		{"event cancelled", `UPDATE events SET status = 'cancelled' WHERE id = $1 AND $2::uuid IS NOT NULL`},
+		{"event closed", `UPDATE events SET status = 'closed' WHERE id = $1 AND $2::uuid IS NOT NULL`},
+		{"before sale_start", `UPDATE ticket_tier SET sale_start = NOW() + INTERVAL '1 minute' WHERE event_id = $1 AND id = $2`},
+		{"after sale_end", `UPDATE ticket_tier SET sale_end = NOW() - INTERVAL '1 minute' WHERE event_id = $1 AND id = $2`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, pool, rdb := newPurchaseServer(t)
+			ctx := context.Background()
+			eventID, tierID := seedTier(t, pool, 1000, 5)
+			userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+			if _, err := pool.Exec(ctx, tc.setup, eventID, tierID); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+
+			resp, out := purchase(t, ts, jwtTok, "closed-key", purchaseBody(eventID, tierID, 1, purchaseTok))
+			if resp.StatusCode != http.StatusGone {
+				t.Fatalf("status = %d body=%v, want 410", resp.StatusCode, out)
+			}
+			if got := out["error"].(map[string]any)["type"]; got != "sales_closed" {
+				t.Errorf("error type = %v, want sales_closed", got)
+			}
+			var bookings int
+			if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM booking WHERE user_id = $1`, userID).Scan(&bookings); err != nil {
+				t.Fatalf("count: %v", err)
+			}
+			if bookings != 0 {
+				t.Errorf("bookings = %d, want 0", bookings)
+			}
+			if n, _ := rdb.Exists(ctx, booking.InventoryKey(tierID)).Result(); n != 0 {
+				t.Errorf("inventory was touched before the sale check")
+			}
+		})
+	}
+}
+
+func TestPurchaseAllowedInsideSaleWindow(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	eventID, tierID := seedTier(t, pool, 1000, 5)
+	_, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE ticket_tier SET sale_start = NOW() - INTERVAL '1 minute', sale_end = NOW() + INTERVAL '1 minute' WHERE id = $1`,
+		tierID); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	resp, out := purchase(t, ts, jwtTok, "open-key", purchaseBody(eventID, tierID, 1, purchaseTok))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d body=%v, want 201", resp.StatusCode, out)
+	}
+}
+
+// 2^62 x 4 wraps int64 to exactly zero, which satisfies total_cents >= 0 and
+// would confirm the booking for free.
+func TestPurchaseRejectsTotalOverflow(t *testing.T) {
+	ts, pool, rdb := newPurchaseServer(t)
+	ctx := context.Background()
+	eventID, tierID := seedTier(t, pool, 4611686018427387904, 5)
+	userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+
+	resp, out := purchase(t, ts, jwtTok, "overflow-key", purchaseBody(eventID, tierID, 4, purchaseTok))
+	if resp.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d body=%v, want 422", resp.StatusCode, out)
+	}
+	var bookings int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM booking WHERE user_id = $1`, userID).Scan(&bookings); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if bookings != 0 {
+		t.Errorf("bookings = %d, want 0", bookings)
+	}
+	if n, _ := rdb.Exists(ctx, booking.InventoryKey(tierID)).Result(); n != 0 {
+		t.Errorf("inventory was touched before the overflow check")
+	}
+}
+
+func TestOversizedBodyRejected(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	ctx := context.Background()
+	eventID, _ := seedTier(t, pool, 1000, 5)
+	userID, jwtTok, _ := admittedUser(t, pool, eventID, 1)
+	huge := `{"email":"` + strings.Repeat("a", api.MaxBodyBytes+1) + `","password":"supersecret1"}`
+
+	for _, path := range []string{"/v1/auth/register", "/v1/auth/login", "/v1/purchases"} {
+		t.Run(path, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(huge))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+jwtTok)
+			req.Header.Set("Idempotency-Key", "huge-key")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Errorf("status = %d, want 413", resp.StatusCode)
+			}
+		})
+	}
+
+	// Rejected before the claim, so the key is not burned for a real retry.
+	var claims int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM idempotency_keys WHERE user_id = $1`, userID).Scan(&claims); err != nil {
+		t.Fatal(err)
+	}
+	if claims != 0 {
+		t.Errorf("idempotency claims = %d, want 0", claims)
+	}
+}
+
+// TX1 committed, so the booking exists and the charge may land. A disconnect
+// must not abandon it halfway: the attempt is recorded and a retry can read it.
+func TestPurchaseClientDisconnectFinishesTheAttempt(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	ctx := context.Background()
+	eventID, tierID := seedTier(t, pool, 1000, 5)
+	userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+	body := purchaseBodyTok(eventID, tierID, 1, purchaseTok, "tok_slow_5s")
+	raw, _ := json.Marshal(body)
+
+	clientCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(clientCtx, http.MethodPost, ts.URL+"/v1/purchases", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer "+jwtTok)
+	req.Header.Set("Idempotency-Key", "gave-up")
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("request finished before the client gave up")
+	}
+
+	waitFor(t, "the attempt to be recorded", func() bool {
+		var n int
+		pool.QueryRow(ctx, `SELECT COUNT(*) FROM payments p JOIN booking b ON b.id = p.booking_id
+		                    WHERE b.user_id = $1 AND p.status = 'unknown'`, userID).Scan(&n)
+		return n == 1
+	})
+	waitFor(t, "the outcome to be stored", func() bool {
+		var done bool
+		pool.QueryRow(ctx, `SELECT completed_at IS NOT NULL FROM idempotency_keys WHERE user_id = $1`, userID).Scan(&done)
+		return done
+	})
+
+	resp, out := purchase(t, ts, jwtTok, "gave-up", body)
+	if resp.Header.Get("Idempotency-Replayed") != "true" || resp.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("retry = %d replayed=%q body=%v, want the stored 504", resp.StatusCode, resp.Header.Get("Idempotency-Replayed"), out)
 	}
 }

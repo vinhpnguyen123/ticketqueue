@@ -79,8 +79,8 @@ func main() {
 		pool.Ping,
 		func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
 	))
-	api.NewAuthHandler(pool, rdb, cfg.JWTSecret).Mount(r)
-	api.NewEventsHandler(pool).Mount(r)
+	api.NewAuthHandler(pool, rdb, cfg.JWTSecret, cfg.TrustedProxyHops).Mount(r)
+	api.NewEventsHandler(pool, rdb).Mount(r)
 	api.NewQueueHandler(pool, rdb, cfg.JWTSecret).Mount(r)
 	payments := booking.NewPaymentClient(cfg.PaymentURL, cfg.PaymentKey)
 	api.NewPurchaseHandler(pool, rdb, cfg.JWTSecret, payments).Mount(r)
@@ -90,7 +90,11 @@ func main() {
 	// system and its credential is the HMAC signature.
 	api.NewWebhookHandler(pool, rdb, cfg.WebhookSecret, payments).Mount(r)
 
-	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           api.LimitBody(r),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 
 	go func() {
 		logger.Info("api server listening", "addr", srv.Addr)

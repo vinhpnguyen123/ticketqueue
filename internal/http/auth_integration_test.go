@@ -30,7 +30,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *testServerDeps) {
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
-	api.NewAuthHandler(pool, rdb, testSecret).Mount(r)
+	api.NewAuthHandler(pool, rdb, testSecret, 1).Mount(r)
 
 	ts := httptest.NewServer(r)
 	t.Cleanup(ts.Close)

@@ -26,6 +26,9 @@ const (
 	ProviderFailed      = "failed"
 	ProviderNotFound    = "not_found"
 	ProviderUnreachable = "unreachable"
+	// ProviderInFlight means "not found" on a booking too young for that to
+	// prove anything: the charge may still land. Treated like unreachable.
+	ProviderInFlight = "in_flight"
 )
 
 // Stuck is a booking left 'held' that needs resolving against the provider.
@@ -33,12 +36,17 @@ type Stuck struct {
 	Held
 	IdemKey string
 	TierID  string
+	// CreatedAt is set only for callers that reach a booking of any age (admin,
+	// webhook, sync retry). The workers leave it zero: their scans already
+	// select old enough bookings, and a zero time reads as old.
+	CreatedAt time.Time
 }
 
 // Resolution is the outcome of one reconcile attempt.
 type Resolution struct {
 	// Provider is what the provider said: succeeded | failed | not_found |
-	// unreachable. Unreachable means we learned nothing and changed nothing.
+	// unreachable | in_flight. The last two mean we learned nothing and changed
+	// nothing.
 	Provider string
 	// Status is the booking's status afterwards.
 	Status string
@@ -100,6 +108,13 @@ func ReconcileBooking(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client
 		})
 
 	case NotFound:
+		// A provider still processing a charge has no record of it yet, so on
+		// a young booking this is not a verdict (§3, the money rule). Every
+		// caller goes through here, so none of them can release too early.
+		if time.Since(s.CreatedAt) < StuckAfter {
+			metrics.ReconciliationResolution.WithLabelValues(a.Source, metrics.ResolutionDeferred).Inc()
+			return Resolution{Provider: ProviderInFlight, Status: "held"}, nil
+		}
 		// The provider has no record under this key: no money moved. Failing
 		// is safe, and no payments row is written — there was no attempt.
 		out.Provider = ProviderNotFound
@@ -161,7 +176,7 @@ func resolutionOutcome(o Outcome) string {
 // pgx.ErrNoRows passes through for the handler to map to 404.
 func LoadStuck(ctx context.Context, pool *pgxpool.Pool, bookingID string) (Stuck, string, error) {
 	return scanStuck(pool.QueryRow(ctx,
-		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency, status
+		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency, status, created_at
 		 FROM booking WHERE id = $1`, bookingID))
 }
 
@@ -169,13 +184,13 @@ func LoadStuck(ctx context.Context, pool *pgxpool.Pool, bookingID string) (Stuck
 // webhook knows the idempotency key, never our booking id. Uses idx_booking_idem.
 func LoadStuckByKey(ctx context.Context, pool *pgxpool.Pool, idemKey string) (Stuck, string, error) {
 	return scanStuck(pool.QueryRow(ctx,
-		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency, status
+		`SELECT id, idempotency_key, ticket_tier_id, total_cents, currency, status, created_at
 		 FROM booking WHERE idempotency_key = $1`, idemKey))
 }
 
 func scanStuck(row pgx.Row) (Stuck, string, error) {
 	var s Stuck
 	var status string
-	err := row.Scan(&s.BookingID, &s.IdemKey, &s.TierID, &s.TotalCents, &s.Currency, &status)
+	err := row.Scan(&s.BookingID, &s.IdemKey, &s.TierID, &s.TotalCents, &s.Currency, &status, &s.CreatedAt)
 	return s, status, err
 }

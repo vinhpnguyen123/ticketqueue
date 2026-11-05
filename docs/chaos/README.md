@@ -95,12 +95,13 @@ stopped completing purchases (5,924 → 11,288 confirmed across the outage), the
 left over drained 93s after restart, zero money discrepancies.** All nine checks
 green.
 
-**The run disproved its own premise, which is the interesting part.** Held
-bookings do not climb monotonically while the worker is dead — they rose and fell
-repeatedly, because the **webhook** resolves dropped-response bookings through the
-API in about a second and needs no worker at all. The worker is the backstop for
-what the webhook misses, not the first line of recovery. Two independent recovery
-paths exist, and killing one leaves the other working.
+**Held count here is mostly healthy traffic.** It rose and fell while the worker
+was dead because most held bookings are purchases between TX1 and TX2, roughly
+throughput times duration of them, not bookings waiting for recovery. An earlier
+version of this page credited the webhook for that. That was wrong: this scenario
+never sets `WEBHOOK_URL`, and the Week 6 database shows the webhook resolved one
+booking in total. The check now counts held bookings with an `unknown` payment,
+which is the number that actually needs the worker.
 
 An earlier version of this scenario failed on a readiness probe that timed out
 at 3s while the API was demonstrably confirming ~100 purchases a second. "Kept

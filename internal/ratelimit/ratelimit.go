@@ -35,17 +35,27 @@ end
 return count
 `)
 
-// ByIP keys requests by client IP: first X-Forwarded-For entry when
-// present (we sit behind an ALB in deployment), else RemoteAddr host.
-func ByIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return strings.TrimSpace(strings.Split(xff, ",")[0])
+// ByClientIP keys requests by client IP. Each trusted proxy appends the address
+// it saw to X-Forwarded-For, so only the last trustedHops entries can be believed
+// and the one to use is trustedHops from the right. Anything further left came
+// from the client. With no trusted proxy the header is ignored entirely, and a
+// header too short or malformed to trust falls back to the socket address.
+func ByClientIP(trustedHops int) func(*http.Request) string {
+	return func(r *http.Request) string {
+		if trustedHops > 0 {
+			entries := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+			if i := len(entries) - trustedHops; i >= 0 {
+				if ip := strings.TrimSpace(entries[i]); net.ParseIP(ip) != nil {
+					return ip
+				}
+			}
+		}
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			return r.RemoteAddr
+		}
+		return host
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 // ByUserID keys requests by the authenticated user ID. Returns "" when

@@ -82,9 +82,10 @@ register_and_admit() {
   [[ "$API_STATUS" == "201" ]] || die "register failed ($API_STATUS): $API_BODY"
   JWT=$(jq -r '.data.token' <<<"$API_BODY")
 
-  # The seeded on_sale event, with its first tier.
+  # The oldest on_sale event with tickets left, with its first tier. A load test
+  # leaves its sold-out event on_sale, so status alone is not enough.
   local event_id tier_id
-  event_id=$(psql_one "SELECT id FROM events WHERE status='on_sale' ORDER BY created_at LIMIT 1;")
+  event_id=$(psql_one "SELECT e.id FROM events e WHERE e.status='on_sale' AND EXISTS (SELECT 1 FROM ticket_tier t JOIN tickets k ON k.ticket_tier_id=t.id WHERE t.event_id=e.id AND k.status='available') ORDER BY e.created_at LIMIT 1;")
   [[ -n "$event_id" ]] || die "no on_sale event found — run 'make seed'"
   tier_id=$(psql_one "SELECT id FROM ticket_tier WHERE event_id='$event_id' ORDER BY price_cents DESC LIMIT 1;")
 

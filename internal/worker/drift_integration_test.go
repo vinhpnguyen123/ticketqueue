@@ -5,6 +5,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -348,4 +349,69 @@ func TestDriftCleanSystemStaysSilent(t *testing.T) {
 		t.Errorf("invariant audit rows = %d, want 0", n)
 	}
 	_ = ctx
+}
+
+// Runner runs a cycle at startup, so this is also recovery on restart.
+func TestDriftCycleRepairsQueue(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := seedEvent(t, pool, 1, 300)
+	users := seedUsers(t, pool, rdb, eventID, 3)
+
+	if err := rdb.FlushDB(ctx).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewDriftChecker().Cycle(ctx, rdb, pool); err != nil {
+		t.Fatalf("cycle: %v", err)
+	}
+	got, err := rdb.ZRange(ctx, queue.Key(eventID), 0, -1).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, users) {
+		t.Errorf("queue after drift cycle = %v, want %v", got, users)
+	}
+}
+
+// The value moved after the drift checker read it: a reservation or a
+// compensation landed, and the repair must not erase it.
+func TestCasInventoryKeepsInterveningDelta(t *testing.T) {
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	key := booking.InventoryKey("cas-tier")
+	if err := rdb.Set(ctx, key, 7, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := casInventory(ctx, rdb, key, 9, 10)
+	if err != nil {
+		t.Fatalf("cas: %v", err)
+	}
+	if applied {
+		t.Error("cas applied although the value had moved")
+	}
+	if got, _ := rdb.Get(ctx, key).Int64(); got != 7 {
+		t.Errorf("value = %d, want 7 preserved", got)
+	}
+}
+
+func TestCasInventoryAppliesWhenUnchanged(t *testing.T) {
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	key := booking.InventoryKey("cas-tier")
+	if err := rdb.Set(ctx, key, 9, 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	applied, err := casInventory(ctx, rdb, key, 9, 10)
+	if err != nil {
+		t.Fatalf("cas: %v", err)
+	}
+	if !applied {
+		t.Error("cas did not apply on an unchanged value")
+	}
+	if got, _ := rdb.Get(ctx, key).Int64(); got != 10 {
+		t.Errorf("value = %d, want 10", got)
+	}
 }

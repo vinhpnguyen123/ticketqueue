@@ -140,7 +140,7 @@ func (s *server) createCharge(w http.ResponseWriter, r *http.Request) {
 	if ch, ok := s.st.charges[key]; ok {
 		s.st.mu.RUnlock()
 		slog.Info("charge replayed from idempotency store", "key", key, "status", ch.Status)
-		writeJSON(w, http.StatusOK, ch)
+		writeCharge(w, ch)
 		return
 	}
 	s.st.mu.RUnlock()
@@ -166,7 +166,7 @@ func (s *server) createCharge(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(slow30s)
 		s.succeed(w, req, key, card{"visa", "4242"})
 	case "tok_drops_response":
-		ch := s.record(req, key, "succeeded", card{"visa", "4242"}, "")
+		ch, created := s.record(req, key, "succeeded", card{"visa", "4242"}, "")
 		metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, "dropped").Inc()
 		slog.Info("charge processed, dropping response", "token", req.PaymentToken, "key", key, "charge_id", ch.ID)
 		// Simulates the response being lost on the network AFTER money moved:
@@ -186,7 +186,9 @@ func (s *server) createCharge(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		// The money moved even though the client will never learn it. The
 		// webhook is exactly how ticketqueue finds out.
-		s.notify(ch)
+		if created {
+			s.notify(ch)
+		}
 	case "tok_500_then_succeed":
 		s.st.mu.Lock()
 		burned := s.st.failedOnce[key]
@@ -205,9 +207,16 @@ func (s *server) createCharge(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// record stores the charge outcome under its idempotency key.
-func (s *server) record(req chargeRequest, key, status string, c card, failureCode string) charge {
-	ch := charge{
+// record stores the charge outcome under its idempotency key. The first writer
+// wins: a key has one immutable outcome, so a request that lost the race gets
+// the stored charge back with created=false, and must answer from that.
+func (s *server) record(req chargeRequest, key, status string, c card, failureCode string) (ch charge, created bool) {
+	s.st.mu.Lock()
+	defer s.st.mu.Unlock()
+	if existing, ok := s.st.charges[key]; ok {
+		return existing, false
+	}
+	ch = charge{
 		ID:             "ch_" + randHex(8),
 		Status:         status,
 		Amount:         req.Amount,
@@ -217,26 +226,38 @@ func (s *server) record(req chargeRequest, key, status string, c card, failureCo
 		CreatedAt:      time.Now().UTC(),
 		IdempotencyKey: key,
 	}
-	s.st.mu.Lock()
 	s.st.charges[key] = ch
-	s.st.mu.Unlock()
-	return ch
+	return ch, true
 }
 
 func (s *server) succeed(w http.ResponseWriter, req chargeRequest, key string, c card) {
-	ch := s.record(req, key, "succeeded", c, "")
-	metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, "succeeded").Inc()
-	slog.Info("charge attempt", "token", req.PaymentToken, "key", key, "outcome", "succeeded", "charge_id", ch.ID)
-	writeJSON(w, http.StatusOK, ch)
-	s.notify(ch)
+	ch, created := s.record(req, key, "succeeded", c, "")
+	metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, ch.Status).Inc()
+	slog.Info("charge attempt", "token", req.PaymentToken, "key", key, "outcome", ch.Status, "charge_id", ch.ID)
+	writeCharge(w, ch)
+	if created {
+		s.notify(ch)
+	}
 }
 
 func (s *server) fail(w http.ResponseWriter, req chargeRequest, key, failureCode string) {
-	ch := s.record(req, key, "failed", card{}, failureCode)
-	metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, "failed").Inc()
-	slog.Info("charge attempt", "token", req.PaymentToken, "key", key, "outcome", "failed", "failure_code", failureCode)
-	writeJSON(w, http.StatusPaymentRequired, ch)
-	s.notify(ch)
+	ch, created := s.record(req, key, "failed", card{}, failureCode)
+	metrics.ChargeOutcome.WithLabelValues(req.PaymentToken, ch.Status).Inc()
+	slog.Info("charge attempt", "token", req.PaymentToken, "key", key, "outcome", ch.Status, "failure_code", ch.FailureCode)
+	writeCharge(w, ch)
+	if created {
+		s.notify(ch)
+	}
+}
+
+// writeCharge answers from the stored outcome, so a replay and a lost race both
+// say what the ledger says.
+func writeCharge(w http.ResponseWriter, ch charge) {
+	status := http.StatusOK
+	if ch.Status == "failed" {
+		status = http.StatusPaymentRequired
+	}
+	writeJSON(w, status, ch)
 }
 
 func (s *server) getByKey(w http.ResponseWriter, r *http.Request) {

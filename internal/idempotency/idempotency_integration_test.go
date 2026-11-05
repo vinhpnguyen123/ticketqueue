@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -251,5 +252,32 @@ func TestMissingHeader(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Errorf("handler ran %d times, want 0", calls.Load())
+	}
+}
+
+// A client that gave up is the most common reason to retry, so its outcome must
+// still be stored for the retry to replay.
+func TestClientDisconnectStillStoresOutcome(t *testing.T) {
+	pool := testutil.TestDB(t)
+	ts, calls := newIdemServer(t, pool, 200*time.Millisecond)
+	_, token := seedUser(t, pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL, strings.NewReader(`{"a":1}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Idempotency-Key", "gave-up")
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("request finished before the client gave up")
+	}
+	time.Sleep(400 * time.Millisecond) // the handler finishes without the client
+
+	resp, _ := post(t, ts.URL, token, "gave-up", `{"a":1}`)
+	if resp.Header.Get("Idempotency-Replayed") != "true" || resp.StatusCode != http.StatusCreated {
+		t.Errorf("retry = %d replayed=%q, want the stored 201", resp.StatusCode, resp.Header.Get("Idempotency-Replayed"))
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("handler ran %d times, want 1", got)
 	}
 }

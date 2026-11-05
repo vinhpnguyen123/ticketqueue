@@ -73,12 +73,13 @@ func (h *WebhookHandler) Receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.verify(raw, r.Header.Get("X-Webhook-Signature")) {
+	ts := r.Header.Get("X-Webhook-Timestamp")
+	if !h.verify(raw, ts, r.Header.Get("X-Webhook-Signature")) {
 		slog.Warn("webhook rejected: bad signature")
 		response.Error(w, r, http.StatusUnauthorized, "invalid_signature", "signature does not match")
 		return
 	}
-	if !freshTimestamp(r.Header.Get("X-Webhook-Timestamp")) {
+	if !freshTimestamp(ts) {
 		slog.Warn("webhook rejected: stale timestamp")
 		response.Error(w, r, http.StatusUnauthorized, "timestamp_expired", "delivery is too old")
 		return
@@ -90,16 +91,22 @@ func (h *WebhookHandler) Receive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Delivery is at-least-once, so the first thing we do with a valid event is
-	// claim it. Losing this race means someone else already did the work.
-	tag, err := h.pool.Exec(r.Context(),
-		`INSERT INTO webhook_events_seen (event_id) VALUES ($1) ON CONFLICT DO NOTHING`, ev.EventID)
+	// Delivery is at-least-once. An event only counts as handled once
+	// processed_at is set: a row without it is an earlier attempt that failed,
+	// and this delivery is the retry that failure asked for. Two concurrent
+	// deliveries can both get here, which is safe because the shared resolver's
+	// guarded UPDATE lets only one of them apply.
+	var processedAt *time.Time
+	err = h.pool.QueryRow(r.Context(),
+		`INSERT INTO webhook_events_seen (event_id) VALUES ($1)
+		 ON CONFLICT (event_id) DO UPDATE SET event_id = EXCLUDED.event_id
+		 RETURNING processed_at`, ev.EventID).Scan(&processedAt)
 	if err != nil {
 		slog.Error("webhook dedup insert failed", "event_id", ev.EventID, "error", err)
 		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to record webhook")
 		return
 	}
-	if tag.RowsAffected() == 0 {
+	if processedAt != nil {
 		// Already handled. 200 so the provider stops retrying.
 		response.JSON(w, r, http.StatusOK, map[string]any{"status": "duplicate_ignored"})
 		return
@@ -109,9 +116,10 @@ func (h *WebhookHandler) Receive(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolve finds the booking this event belongs to and puts it through the same
-// resolver every other path uses. Anything unexpected still answers 200: a
-// non-2xx makes the provider retry, and retrying will not make an unknown key
-// known or a resolved booking unresolved.
+// resolver every other path uses. An unknown key or a resolved booking answers
+// 200, because a retry cannot change either. A failure, or a provider that gave
+// no verdict, answers non-2xx so the provider retries; reconciliation remains
+// the backstop if it gives up.
 func (h *WebhookHandler) resolve(w http.ResponseWriter, r *http.Request, ev webhookEvent) {
 	stuck, status, err := booking.LoadStuckByKey(r.Context(), h.pool, ev.IdempotencyKey)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -148,6 +156,12 @@ func (h *WebhookHandler) resolve(w http.ResponseWriter, r *http.Request, ev webh
 		return
 	}
 
+	if res.Provider == booking.ProviderUnreachable || res.Provider == booking.ProviderInFlight {
+		response.Error(w, r, http.StatusServiceUnavailable, "provider_unreachable",
+			"could not get a verdict from the provider; retry")
+		return
+	}
+
 	h.markProcessed(r, ev.EventID)
 	slog.Info("webhook resolved booking",
 		"booking_id", stuck.BookingID, "provider", res.Provider, "status", res.Status, "applied", res.Applied)
@@ -157,8 +171,8 @@ func (h *WebhookHandler) resolve(w http.ResponseWriter, r *http.Request, ev webh
 	})
 }
 
-// markProcessed is best-effort bookkeeping: the dedup claim is what matters,
-// and a missing processed_at costs nothing.
+// markProcessed is best-effort: a missing processed_at only means a later
+// duplicate is processed again, which the guarded UPDATE makes harmless.
 func (h *WebhookHandler) markProcessed(r *http.Request, eventID string) {
 	if _, err := h.pool.Exec(r.Context(),
 		`UPDATE webhook_events_seen SET processed_at = NOW() WHERE event_id = $1`, eventID); err != nil {
@@ -168,11 +182,11 @@ func (h *WebhookHandler) markProcessed(r *http.Request, eventID string) {
 
 // verify checks the HMAC in constant time. An early return on a length
 // mismatch is fine — the length is not secret.
-func (h *WebhookHandler) verify(raw []byte, got string) bool {
+func (h *WebhookHandler) verify(raw []byte, ts, got string) bool {
 	if h.secret == "" || got == "" {
 		return false
 	}
-	return hmac.Equal([]byte(got), []byte(paymentsim.Sign(raw, h.secret)))
+	return hmac.Equal([]byte(got), []byte(paymentsim.Sign(ts, raw, h.secret)))
 }
 
 func freshTimestamp(header string) bool {

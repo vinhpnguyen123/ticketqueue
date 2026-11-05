@@ -92,6 +92,10 @@ services:
       redis: {condition: service_healthy}
     environment:
       DATABASE_URL: postgres://ticketqueue:localdev@pgbouncer:6432/ticketqueue?sslmode=disable
+      # No fallback: run through `make docker-up`, which supplies it. Empty makes
+      # the binary refuse to start. Not ${VAR:?}, which would fail every compose
+      # command, including ones for services that do not need it.
+      JWT_SECRET: "${JWT_SECRET:-}"
       PGBOUNCER: "true"
       POOL_MAX_CONNS: "${POOL_MAX_CONNS:-10}"
       REDIS_ADDR: redis:6379
@@ -109,6 +113,10 @@ services:
       redis: {condition: service_healthy}
     environment:
       DATABASE_URL: postgres://ticketqueue:localdev@pgbouncer:6432/ticketqueue?sslmode=disable
+      # No fallback: run through `make docker-up`, which supplies it. Empty makes
+      # the binary refuse to start. Not ${VAR:?}, which would fail every compose
+      # command, including ones for services that do not need it.
+      JWT_SECRET: "${JWT_SECRET:-}"
       PGBOUNCER: "true"
       POOL_MAX_CONNS: "${POOL_MAX_CONNS:-10}"
       REDIS_ADDR: redis:6379

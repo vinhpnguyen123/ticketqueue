@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -274,5 +275,53 @@ func TestChaosSwitchBlackholesThenRecovers(t *testing.T) {
 	// And the provider is serving again immediately, not after its own timer.
 	if resp, _ := postCharge(t, ts, "chaos-after", "tok_visa"); resp.StatusCode != http.StatusOK {
 		t.Fatalf("after outage: want 200, got %d", resp.StatusCode)
+	}
+}
+
+// One key has one outcome, whichever request gets there first. Mixed tokens make
+// a lost race visible: a late decline must not overwrite a stored success.
+func TestConcurrentSameKeyOneOutcome(t *testing.T) {
+	ts := newTestServer(t)
+	const n = 20
+	type result struct {
+		code   int
+		id     string
+		status string
+	}
+	results := make([]result, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range n {
+		token := "tok_visa"
+		if i%2 == 1 {
+			token = "tok_declined"
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, body := postCharge(t, ts, "race-key", token)
+			results[i] = result{resp.StatusCode, body["id"].(string), body["status"].(string)}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	first := results[0]
+	for _, r := range results {
+		if r.id != first.id || r.status != first.status {
+			t.Fatalf("outcomes differ: %+v vs %+v", r, first)
+		}
+		want := http.StatusOK
+		if r.status == "failed" {
+			want = http.StatusPaymentRequired
+		}
+		if r.code != want {
+			t.Errorf("status %q answered HTTP %d, want %d", r.status, r.code, want)
+		}
+	}
+	_, stored := lookupByKey(t, ts, "race-key")
+	if stored["id"] != first.id {
+		t.Errorf("ledger holds %v, responses said %v", stored["id"], first.id)
 	}
 }

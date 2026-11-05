@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
@@ -37,8 +38,8 @@ func NewDriftChecker() *DriftChecker {
 	return &DriftChecker{pending: map[string]observation{}}
 }
 
-// Cycle runs all three jobs. They are independent: a failure in one must not
-// cost the other two their turn, so each is recovered and its error collected
+// Cycle runs all four jobs. They are independent: a failure in one must not
+// cost the others their turn, so each is recovered and its error collected
 // rather than returned immediately.
 func (d *DriftChecker) Cycle(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool) error {
 	jobs := []struct {
@@ -48,6 +49,7 @@ func (d *DriftChecker) Cycle(ctx context.Context, rdb *redis.Client, pool *pgxpo
 		{"inventory", func() error { return d.checkInventory(ctx, rdb, pool) }},
 		{"invariants", func() error { return checkInvariants(ctx, pool) }},
 		{"abandoned_queue", func() error { return sweepAbandonedQueueEntries(ctx, rdb, pool) }},
+		{"queue_sync", func() error { return syncQueues(ctx, rdb, pool) }},
 	}
 
 	var failed []string
@@ -125,7 +127,9 @@ func (d *DriftChecker) checkInventory(ctx context.Context, rdb *redis.Client, po
 		if errors.Is(err, redis.Nil) {
 			// Never initialised (or evicted). Seeding it from truth is not a
 			// correction and must not be counted as drift.
-			if err := rdb.Set(ctx, key, t.truth, 0).Err(); err != nil {
+			// SetNX: a purchase initialising the same key may have decremented
+			// it since the read above, and truth here is older than that.
+			if err := rdb.SetNX(ctx, key, t.truth, 0).Err(); err != nil {
 				return fmt.Errorf("lazy init %s: %w", key, err)
 			}
 			delete(d.pending, t.id)
@@ -151,10 +155,16 @@ func (d *DriftChecker) checkInventory(ctx context.Context, rdb *redis.Client, po
 		}
 
 		// Same numbers twice running: real drift. Postgres wins (§3 #1).
-		if err := rdb.Set(ctx, key, t.truth, 0).Err(); err != nil {
+		applied, err := casInventory(ctx, rdb, key, cached, t.truth)
+		if err != nil {
 			return fmt.Errorf("correct %s: %w", key, err)
 		}
 		delete(d.pending, t.id)
+		if !applied {
+			// The counter moved after we read it, so work is in flight and the
+			// numbers above are stale. Start the two-cycle check over.
+			continue
+		}
 		metrics.InventoryDrift.Inc()
 		slog.Warn("inventory drift corrected", "tier_id", t.id, "was", cached, "now", t.truth)
 
@@ -171,6 +181,21 @@ func (d *DriftChecker) checkInventory(ctx context.Context, rdb *redis.Client, po
 		}
 	}
 	return nil
+}
+
+// casInventoryScript writes value only if the key still holds expected, so a
+// reservation or compensation landing between the read and this write survives.
+var casInventoryScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+	redis.call('SET', KEYS[1], ARGV[2])
+	return 1
+end
+return 0
+`)
+
+func casInventory(ctx context.Context, rdb *redis.Client, key string, expected, value int64) (bool, error) {
+	applied, err := casInventoryScript.Run(ctx, rdb, []string{key}, expected, value).Int()
+	return applied == 1, err
 }
 
 // ---------------------------------------------------------------- JOB B
@@ -325,4 +350,28 @@ func auditSystem(ctx context.Context, pool *pgxpool.Pool, entityType, entityID, 
 		return fmt.Errorf("audit %s: %w", action, err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------- JOB D
+
+// syncQueues repairs every on_sale event's Redis queue from Postgres. Promotion
+// reads Postgres, so a lost or stale queue never blocks admission; this keeps
+// position lookups truthful. One failing event does not cost the others a turn.
+func syncQueues(ctx context.Context, rdb *redis.Client, pool *pgxpool.Pool) error {
+	rows, err := pool.Query(ctx, `SELECT id FROM events WHERE status = 'on_sale'`)
+	if err != nil {
+		return fmt.Errorf("list on_sale events: %w", err)
+	}
+	eventIDs, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return fmt.Errorf("list on_sale events: %w", err)
+	}
+
+	var errs []error
+	for _, id := range eventIDs {
+		if err := queue.SyncFromPostgres(ctx, rdb, pool, id); err != nil {
+			errs = append(errs, fmt.Errorf("event %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
 }

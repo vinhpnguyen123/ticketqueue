@@ -42,7 +42,12 @@ func main() {
 	var opts []paymentsim.Option
 	webhookURL := os.Getenv("WEBHOOK_URL")
 	if webhookURL != "" {
-		opts = append(opts, paymentsim.WithWebhook(webhookURL, envOr("WEBHOOK_SECRET", "whsec_localdev")))
+		webhookSecret := os.Getenv("WEBHOOK_SECRET")
+		if webhookSecret == "" {
+			slog.Error("WEBHOOK_URL is set but WEBHOOK_SECRET is empty")
+			os.Exit(1)
+		}
+		opts = append(opts, paymentsim.WithWebhook(webhookURL, webhookSecret))
 		slog.Info("webhook delivery enabled", "url", webhookURL)
 	}
 
