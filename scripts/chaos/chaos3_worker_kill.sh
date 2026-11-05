@@ -85,16 +85,17 @@ CONFIRMED_DURING="$(confirmed_count)"
 step "Assertions DURING the worker outage"
 assert_eq "$CONFIRMED_ALWAYS_RISING" "1" "the API kept completing purchases at every sample, with no worker alive"
 assert_ge "$CONFIRMED_DURING" "$((HELD_AT_KILL + 1))" "purchases still completed — the happy path needs no worker"
-assert_ge "$HELD_PEAK" "$HELD_AT_KILL" "unresolved bookings accumulated while nothing could resolve them"
+# Counts bookings with an 'unknown' payment, not all held ones. At this load most
+# held bookings are healthy purchases between TX1 and TX2, about rate x duration
+# of them, so comparing raw held counts compares two random samples of traffic.
+AMBIGUOUS_AT_END="$(pg1 "SELECT count(*) FROM booking b WHERE b.status='held' AND b.ticket_tier_id='$TIER_ID' AND EXISTS (SELECT 1 FROM payments p WHERE p.booking_id=b.id AND p.status='unknown');")"
+assert_ge "$AMBIGUOUS_AT_END" "1" "ambiguous bookings stayed unresolved while nothing could resolve them"
 info "readiness probe timed out $HEALTH_TIMEOUTS time(s) — a saturation signal, not an outage"
 
-# WHAT THIS RUN ACTUALLY SHOWED, and it is not what the scenario assumed:
-# held does not climb monotonically while the worker is dead. It rose to
-# $HELD_PEAK and fell again, because the WEBHOOK resolves dropped-response
-# bookings through the API in about a second and needs no worker at all. The
-# worker is the backstop for the cases the webhook misses, not the first line.
-# That is a stronger result than "the backlog grows": two independent recovery
-# paths exist, and killing one leaves the other working.
+# Held does not climb steadily here, and that is not a recovery path at work: the
+# number is dominated by in-flight purchases. No webhook is configured in this
+# scenario (start_proc does not set WEBHOOK_URL), so while the worker is dead an
+# ambiguous booking simply waits for it.
 # Nothing may be lost while the only thing that could repair it is dead.
 assert_eq "$(pg1 "SELECT count(*) FROM booking b WHERE b.status='held' AND NOT EXISTS (SELECT 1 FROM tickets t WHERE t.booking_id=b.id);")" \
   "0" "every held booking still owns its tickets — nothing was lost"
