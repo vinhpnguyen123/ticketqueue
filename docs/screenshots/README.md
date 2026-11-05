@@ -1,10 +1,8 @@
 # Week 8 README assets
 
 Text captures are committed here verbatim (ANSI stripped). The two Grafana
-panels still need a human with a browser; each link below has the run's exact
-window pinned in `from`/`to`, so the capture can be taken any time within
-Prometheus' 15-day retention and will show precisely the seconds the run
-covered. Save each as the filename given.
+panels below are optional extras from the September runs, whose data has aged out
+of Prometheus' 15-day retention, so their links now show nothing.
 
 ## Captured
 
@@ -16,6 +14,10 @@ covered. Save each as the filename given.
 | `verify-run-all-checks-pass.txt` | `verify_run.sql` after the 500-VU run, all nine PASS |
 | `verify-run-oversell-run{1,2,3}.txt` | `verify_run.sql` after each oversell run |
 | `verify-run-latency-2000tickets.txt` | `verify_run.sql` after the latency run |
+
+| `grafana-held-during-outage.png` | Bookings held during CHAOS 2, run of 2026-11-04 |
+| `grafana-latency-by-phase.png` | P95 by phase during a 500-VU run, 2026-11-04 |
+| `grafana-connection-pool.png` | Pool in use against its ceiling, same run |
 
 ## To capture — Grafana, `http://localhost:3000/d/ticketqueue/ticketqueue`
 

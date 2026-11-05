@@ -125,6 +125,21 @@ is not, so that is the failure the system refuses to risk.
 - **Throughput:** about 360 purchases/s at 500 concurrent users on a laptop, with
   zero errors up to 8,000. At 10,000 the OS dropped 16.5% of connections, and the
   app still sold exactly the right number of tickets.
+![Bookings held during a 90-second provider outage](docs/screenshots/grafana-held-during-outage.png)
+
+*The provider goes down: 500 bookings stay frozen at a flat line and nothing is
+released. They only start to resolve once the provider can answer again.*
+
+![P95 purchase latency by phase](docs/screenshots/grafana-latency-by-phase.png)
+
+*Stacked, during a 500-user run. The payment call is about 5ms. The time is in the
+database transactions, which is why the pool looked like the problem.*
+
+![Connection pool pinned at its limit](docs/screenshots/grafana-connection-pool.png)
+
+*The misleading signal: the pool sits at its ceiling of 10 under load. Widening it
+fivefold changed nothing.*
+
 - **Open question:** after the final review fixes, a 5-run comparison gave medians
   of 260 and 230 purchases/s, too noisy on a laptop to call. No cause was found,
   and it needs re-measuring on separate hardware.
@@ -207,3 +222,7 @@ k6, Terraform, GitHub Actions. Raw SQL throughout, no ORM.
 The [demo page](site) is plain HTML and JavaScript. It replays a recording made by
 [scripts/capture_replay.py](scripts/capture_replay.py), so every number on it comes
 from a real run.
+
+## License
+
+[MIT](LICENSE)

@@ -2,6 +2,9 @@ apiVersion: 1
 
 datasources:
   - name: Prometheus
+    # Pinned: the dashboard JSON refers to this uid, and without it Grafana
+    # generates a random one and every panel fails with "Data source not found".
+    uid: prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
