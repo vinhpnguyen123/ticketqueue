@@ -412,3 +412,26 @@ func TestQueueJoinRedisDownReportsNullPosition(t *testing.T) {
 		t.Errorf("body = %v, want null position and queue_size", out.Data)
 	}
 }
+
+// Every poll already reads Postgres to load the event, so the durable check has
+// no reason to stop at the front of the queue.
+func TestPositionFindsAdmissionDeepInStaleSet(t *testing.T) {
+	ts, pool, _ := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE events SET max_concurrent_windows = 1 WHERE id = $1`, eventID); err != nil {
+		t.Fatal(err)
+	}
+	_, firstTok := registerUser(t, ts, "deep-first@test.dev")
+	secondID, secondTok := registerUser(t, ts, "deep-second@test.dev")
+	base := fmt.Sprintf("%s/v1/events/%s/queue", ts.URL, eventID)
+	doQueue(t, http.MethodPost, base+"/join", firstTok, nil)
+	doQueue(t, http.MethodPost, base+"/join", secondTok, nil)
+	admitDirect(t, pool, secondID, eventID)
+
+	var pos queuePositionBody
+	resp := doQueue(t, http.MethodGet, base+"/position", secondTok, &pos)
+	if resp.StatusCode != http.StatusOK || pos.Data.Status != "admitted" || pos.Data.PurchaseToken == "" {
+		t.Fatalf("status=%d body=%+v, want admitted with a token", resp.StatusCode, pos.Data)
+	}
+}

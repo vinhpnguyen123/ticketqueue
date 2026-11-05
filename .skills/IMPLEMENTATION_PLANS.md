@@ -512,9 +512,9 @@ GAP: "not found" from the provider is only a verdict on an old booking → FIXED
 
 A provider still processing a charge has no record of it. ReconcileBooking now treats NotFound on a booking younger than booking.StuckAfter as in flight: nothing changes, and the caller reports it (admin 409 payment_may_be_in_flight, webhook 503). Reconciliation and hold-expiry were already safe through their scan age; the check sits in the shared resolver so no caller can skip it.
 
-GAP: a stale Redis member can show 'waiting' after admission → BOUNDED (rev. 6)
+GAP: a stale Redis member can show 'waiting' after admission → FIXED (rev. 6)
 
-Admission commits before ZREM, so a crash or failed ZREM leaves an admitted user in the set. Position reads the durable row when the user's rank is below max_concurrent_windows, and whenever Redis fails. Admission is FIFO, so stale members sit at the front, and everyone behind them stays on the Redis-only path, because Postgres CPU is the measured bottleneck (§17). Residual: if stale members ever outnumber max_concurrent_windows, the excess reads 'waiting' until the next queue sync (at most 60s).
+Admission commits before ZREM, so a crash or failed ZREM leaves an admitted user in the set. Position therefore always answers from the durable row, and Redis only supplies the rank. An earlier version of this fix checked Postgres only near the front of the queue to protect Postgres CPU; the final review showed every poll already reads Postgres to load the event, so that saved nothing and left a gap. Possible later optimisation: stop loading tiers on Position, which would actually reduce that load.
 
 ═══════════════════════════════════════════
 

@@ -149,14 +149,9 @@ func (h *QueueHandler) Position(w http.ResponseWriter, r *http.Request) {
 		waiting["position"], waiting["queue_size"] = rank+1, size
 	}
 
-	// Redis can only be behind Postgres about who was admitted: a worker crash
-	// or a failed ZREM leaves a committed admission still in the set. Admission
-	// is FIFO, so such a member sits at the front. Only the front therefore needs
-	// the durable check, which keeps the polling crowd behind it off Postgres.
-	if found && rank >= int64(e.MaxConcurrentWindows) {
-		response.JSON(w, r, http.StatusOK, waiting)
-		return
-	}
+	// Redis can be behind Postgres about who was admitted: a worker crash or a
+	// failed ZREM leaves a committed admission still in the set. The durable row
+	// decides. One indexed lookup is small next to loadEvent's reads above.
 	h.respondFromEntry(w, r, e, userID, waiting)
 }
 
