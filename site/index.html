@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TicketQueue: when the payment response never arrives</title>
+  <meta name="description" content="Replays of two real runs of a Go ticketing backend: a lost payment response, and 200 buyers competing for 20 tickets.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Alfa+Slab+One&family=Public+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header class="intro">
+      <h1>The card was charged. The response never arrived. Who gets the ticket?</h1>
+      <p>TicketQueue is a ticket booking backend in Go, built so that a network failure can
+        never oversell a seat or lose a customer's money. These are replays of real runs.</p>
+    </header>
+
+    <section class="scene" aria-labelledby="lost-title">
+      <h2 id="lost-title" class="visually-hidden">A lost payment response</h2>
+
+      <div class="ticket" id="ticket">
+        <div class="ticket-main">
+          <p class="ticket-event">Admit <span id="ticket-qty"></span></p>
+          <p class="ticket-ref" id="ticket-ref"></p>
+          <p class="ticket-price" id="ticket-price"></p>
+        </div>
+        <div class="ticket-stub">
+          <p class="stamp" id="stamp" data-state="none" role="status"></p>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button type="button" id="play-lost">Replay the lost payment</button>
+        <p class="clock"><span id="clock">0</span>s since the purchase. Replayed 10 times faster than it happened.</p>
+      </div>
+
+      <div class="ledgers">
+        <section class="ledger" aria-labelledby="ours-title">
+          <h3 id="ours-title">What our database knows</h3>
+          <ol id="ours" aria-live="polite"><li class="empty">Press replay to watch this record fill in.</li></ol>
+        </section>
+        <section class="ledger" aria-labelledby="theirs-title">
+          <h3 id="theirs-title">What the payment provider knows</h3>
+          <ol id="theirs" aria-live="polite"><li class="empty">Press replay to watch this record fill in.</li></ol>
+        </section>
+      </div>
+
+      <p class="verdict" id="lost-verdict" hidden></p>
+    </section>
+
+    <section class="scene crowd" aria-labelledby="crowd-title">
+      <h2 id="crowd-title"><span id="buyers"></span> people want <span id="tickets"></span> tickets at the same instant</h2>
+      <p>Each stub below is a real ticket, filled in the order the database gave it out.
+        All of them were gone within <span id="crowd-ms"></span> milliseconds, so this is slowed down.</p>
+      <div class="controls">
+        <button type="button" id="play-crowd">Replay the rush</button>
+      </div>
+      <ol class="stubs" id="stubs" aria-label="Tickets in the order they were sold"></ol>
+      <dl class="tally" id="tally" hidden>
+        <div><dt>Sold</dt><dd id="sold"></dd></div>
+        <div><dt>Turned away</dt><dd id="away"></dd></div>
+        <div><dt>Oversold</dt><dd id="oversold"></dd></div>
+      </dl>
+    </section>
+
+    <footer class="notes">
+      <p>Recorded on <span id="captured"></span> from a real run on one laptop. No server is running
+        behind this page, and the payment provider is a simulator built to fail on demand.</p>
+      <p><a href="https://github.com/vinhpnguyen123/ticketqueue">Read the code on GitHub</a>
+        or <a href="https://github.com/vinhpnguyen123/ticketqueue/blob/main/docs/load-test-results.md">see the load test results and their limits</a>.</p>
+    </footer>
+  </main>
+  <p class="load-error" id="load-error" role="alert" hidden>The recording could not be loaded. Reload the page, or read the results on GitHub.</p>
+  <script src="app.js" type="module"></script>
+</body>
+</html>

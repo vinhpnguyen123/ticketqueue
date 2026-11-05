@@ -1,0 +1,123 @@
+{
+ "captured_on": "2026-11-05",
+ "lost_response": {
+  "reference": "TQ-31DE8C2C",
+  "quantity": 2,
+  "total_cents": 100000,
+  "currency": "USD",
+  "charged_at_ms": 19,
+  "charge_amount": 100000,
+  "charge_status": "succeeded",
+  "resolved_at_ms": 113379,
+  "events": [
+   {
+    "at_ms": 0,
+    "action": "booking_created",
+    "actor": "user"
+   },
+   {
+    "at_ms": 17,
+    "action": "payment_outcome_unknown",
+    "actor": "system"
+   },
+   {
+    "at_ms": 113379,
+    "action": "booking_confirmed",
+    "actor": "worker"
+   },
+   {
+    "at_ms": 113379,
+    "action": "payment_succeeded",
+    "actor": "worker"
+   }
+  ]
+ },
+ "stampede": {
+  "buyers": 200,
+  "tickets": 20,
+  "sold": 20,
+  "turned_away": 180,
+  "claims": [
+   {
+    "at_ms": 0,
+    "reference": "TQ-973C3261"
+   },
+   {
+    "at_ms": 17,
+    "reference": "TQ-28D98A0C"
+   },
+   {
+    "at_ms": 22,
+    "reference": "TQ-8ECFC065"
+   },
+   {
+    "at_ms": 22,
+    "reference": "TQ-F6AB5C58"
+   },
+   {
+    "at_ms": 23,
+    "reference": "TQ-7ACC1FC2"
+   },
+   {
+    "at_ms": 23,
+    "reference": "TQ-BC5141EC"
+   },
+   {
+    "at_ms": 23,
+    "reference": "TQ-F28D963F"
+   },
+   {
+    "at_ms": 23,
+    "reference": "TQ-49CA052C"
+   },
+   {
+    "at_ms": 23,
+    "reference": "TQ-3DBA2742"
+   },
+   {
+    "at_ms": 23,
+    "reference": "TQ-063BBE4F"
+   },
+   {
+    "at_ms": 60,
+    "reference": "TQ-06D6071E"
+   },
+   {
+    "at_ms": 63,
+    "reference": "TQ-58E164F3"
+   },
+   {
+    "at_ms": 67,
+    "reference": "TQ-7F4B4E26"
+   },
+   {
+    "at_ms": 67,
+    "reference": "TQ-863D6E08"
+   },
+   {
+    "at_ms": 68,
+    "reference": "TQ-798E89A0"
+   },
+   {
+    "at_ms": 71,
+    "reference": "TQ-D26D2C6B"
+   },
+   {
+    "at_ms": 71,
+    "reference": "TQ-B9044208"
+   },
+   {
+    "at_ms": 71,
+    "reference": "TQ-6ABBBC9A"
+   },
+   {
+    "at_ms": 71,
+    "reference": "TQ-8E5E6144"
+   },
+   {
+    "at_ms": 72,
+    "reference": "TQ-9C268289"
+   }
+  ]
+ }
+}

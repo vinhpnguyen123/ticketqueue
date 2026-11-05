@@ -7,6 +7,8 @@ It guarantees no overselling under heavy concurrency and no double charges under
 network failure. When it cannot know whether a customer was charged, it refuses
 to guess, and resolves the booking later by asking the payment provider.
 
+**[Watch replays of two real runs](https://vinhpnguyen123.github.io/ticketqueue/)**
+
 | Result | Measured |
 |---|---|
 | **Overselling** | 2,000 concurrent buyers, 100 tickets: exactly 100 sold, 0 oversold |
@@ -201,3 +203,7 @@ What would need to change before real traffic:
 
 Go, chi, pgx, go-redis, PostgreSQL, Redis, Docker Compose, Prometheus, Grafana,
 k6, Terraform, GitHub Actions. Raw SQL throughout, no ORM.
+
+The [demo page](site) is plain HTML and JavaScript. It replays a recording made by
+[scripts/capture_replay.py](scripts/capture_replay.py), so every number on it comes
+from a real run.
