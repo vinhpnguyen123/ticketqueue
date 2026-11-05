@@ -431,3 +431,28 @@ the kill, 286 at the peak). It now counts held bookings with an `unknown` paymen
 and the re-run passed with 23 of them waiting and a 207-booking backlog drained in
 122s. Both runs are kept in `docs/chaos/`.
 
+### Final run, after the branch review fixes
+
+The review added Redis timeouts, transactional queue audit rows, durable Position
+reads and disconnect handling. Everything was re-run on that final code: 100 of
+100 and 2,000 of 2,000 sold, verify_run passing after both, PgBouncer suite green,
+demo recovered in 112s, and all three chaos scenarios passed (CHAOS 1: 8 stranded,
+resolved in 117s. CHAOS 2: 500 frozen, 0 released, resolved within 39s. CHAOS 3:
+79 left over, drained). Use these numbers rather than the table above where they
+differ; a kill lands on whatever is in flight, so CHAOS 1 varies by run.
+
+**Throughput is unresolved.** That run measured 147 purchases/s, so old and new
+binaries were compared on the same 2,000-VU, 2,000-ticket storm, interleaved and
+then with the order reversed:
+
+| | Purchases/s, sorted | Median |
+|---|---|---|
+| Before the review fixes (dff2639) | 211, 222, 260, 264, 321 | 260 |
+| After them | 141, 166, 230, 238, 268 | 230 |
+
+Five runs each on a busy laptop do not separate these. Two of the five new runs
+were slow, and none of the old ones were. No errors were logged in those runs and
+the purchase path gained no query, so no mechanism was found. Treat a possible
+slowdown of up to about 10% as open, and settle it on the AWS run, where the
+database has its own hardware and the load generator does not share it.
+
