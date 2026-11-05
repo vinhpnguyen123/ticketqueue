@@ -1,0 +1,69 @@
+[1mchaos2-provider-outage[0m  2026-11-05T21:28:05Z
+  [2mVUs=500  output=/Users/vinhnguyen/ticketqueue/docs/chaos/chaos2-provider-outage-20261105T162805.txt[0m
+  [2mbuilding into /var/folders/rv/vqlccvrx6mj_rtbdjc5v1b2r0000gn/T//ticketqueue-chaos-49255[0m
+
+[1m▸ Start the world[0m
+  [2mpayments started (pid 49558)[0m
+  [2mworker started (pid 49559)[0m
+  [2mseeding: 40000 tickets, 500 users[0m
+  [2mtier 7d94f127-9b02-4de0-89ef-d248e1943767[0m
+  [2mapi started (pid 49614)[0m
+
+[1m▸ Load: 500 VUs, 150s, sustained[0m
+
+[1m▸ Provider UNREACHABLE for 90s[0m
+  {"seconds":90,"unreachable_until":"2026-11-05T21:30:25Z"}
+
+  [2mtickets available at outage start: 33501  (this number must never RISE)[0m
+  [2mt+39 s  held=500    available=33000  deferred_total=0    [0m
+  [2mt+53 s  held=500    available=33000  deferred_total=4    [0m
+  [2mt+68 s  held=500    available=33000  deferred_total=9    [0m
+  [2mt+81 s  held=500    available=33000  deferred_total=13   [0m
+  [2mt+95 s  held=500    available=33000  deferred_total=18   [0m
+  [2mt+109s  held=500    available=33000  deferred_total=23   [0m
+  [2mt+123s  held=386    available=32611  deferred_total=25   [0m
+
+[1m▸ Assertions DURING the outage[0m
+  [32mPASS[0m  bookings piled up in 'held' while the provider was away (500 >= 1)
+  [32mPASS[0m  reconciliation_resolution_total{outcome=deferred} incremented (25 >= 1)
+  [32mPASS[0m  ZERO tickets returned to 'available' on a guess (33501 <= 33501)
+  [32mPASS[0m  hold-expiry deferred at least one booking (70 >= 1)
+  [32mPASS[0m  exactly one 'expiry_deferred_provider_unreachable' row per affected booking (70)
+
+[1m▸ Provider BACK[0m
+  {"seconds":0,"unreachable_until":"2026-11-05T21:30:36Z"}
+
+
+[1m▸ Recovery[0m
+  [32mPASS[0m  every stranded booking resolved in 31s
+
+[1m▸ Assertions AFTER recovery[0m
+  [32mPASS[0m  zero bookings left 'held' (0)
+  [32mPASS[0m  no further deferral rows were written once the provider answered (70)
+
+[1m▸ Money correctness (scripts/verify_run.sql)[0m
+  [32mPASS[0m  all nine checks green
+     PASS   |                  0
+     PASS   |              0
+     PASS   |       262501 |        262501
+     PASS   |            0
+     PASS   |                0
+     PASS   |  13125050000 |   13125050000
+     PASS   |         0
+     PASS   |           0
+     PASS   |           0
+     PASS   |              0
+
+[1m▸ RESULT[0m
+  [1mProvider down for 90s. 500 bookings held, 0 tickets released on a guess, all of them resolved within 31s of recovery.[0m
+  [2mk6 detail: /Users/vinhnguyen/ticketqueue/docs/chaos/chaos2-provider-outage-20261105T162805-k6.txt[0m
+
+[1m▸ Grafana, this run's window[0m
+  http://localhost:3000/d/ticketqueue/ticketqueue?from=1793914055000&to=1793914304000
+  [2mRow 4 (Money & recovery): bookings_held_current rising then draining, with admin_stuck_bookings_current{category=charged_not_delivered} flat at 0.[0m
+
+[1m▸ VERDICT[0m
+  [32m[1mchaos2-provider-outage PASSED[0m — /Users/vinhnguyen/ticketqueue/docs/chaos/chaos2-provider-outage-20261105T162805.txt
+scripts/chaos/lib.sh: line 112: 49558 Killed: 9               PAYMENT_PORT="$PAYMENT_PORT" nohup "$BUILD_DIR/payment-service" > "$BUILD_DIR/payments.log" 2>&1
+scripts/chaos/lib.sh: line 112: 49559 Killed: 9               PAYMENT_URL="$PAYMENT_URL" METRICS_PORT="$WORKER_METRICS_PORT" nohup "$BUILD_DIR/worker" > "$BUILD_DIR/worker.log" 2>&1
+scripts/chaos/lib.sh: line 112: 49614 Killed: 9               PORT="$API_PORT" PAYMENT_URL="$PAYMENT_URL" nohup "$BUILD_DIR/api" > "$BUILD_DIR/api.log" 2>&1

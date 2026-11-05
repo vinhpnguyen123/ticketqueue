@@ -1,0 +1,35 @@
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 48758  399.702369/s
+    checks_succeeded...: 99.92% 48720 out of 48758
+    checks_failed......: 0.07%  38 out of 48758
+
+    ✗ purchase answered without a server error
+      ↳  99% — ✓ 24341 / ✗ 38
+    ✓ purchase outcome is one the system defines
+
+    CUSTOM
+    purchase_ambiguous_duration....: avg=2.36s min=1.61s    med=2.09s max=7.25s p(90)=2.88s p(95)=3.38s
+    purchase_completed_duration....: avg=2.59s min=1.51s    med=2.25s max=7.62s p(90)=3.5s  p(95)=4.44s
+    purchase_outcomes..............: 24379  199.851184/s
+
+    HTTP
+    http_req_duration..............: avg=2.49s min=228.04ms med=2.21s max=7.62s p(90)=3.45s p(95)=4.36s
+      { expected_response:true }...: avg=2.49s min=228.04ms med=2.21s max=7.62s p(90)=3.45s p(95)=4.36s
+    http_req_failed................: 0.15%  38 out of 24379
+    http_reqs......................: 24379  199.851184/s
+
+    EXECUTION
+    iteration_duration.............: avg=2.49s min=228.23ms med=2.21s max=7.62s p(90)=3.45s p(95)=4.36s
+    iterations.....................: 24379  199.851184/s
+    vus............................: 225    min=225         max=500
+    vus_max........................: 500    min=500         max=500
+
+    NETWORK
+    data_received..................: 8.4 MB 69 kB/s
+    data_sent......................: 23 MB  187 kB/s
+
+
+
