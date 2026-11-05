@@ -504,6 +504,10 @@ GAP: audit_log write volume → DOCUMENT
 
 Audit writes were 24.5% of database exec time, at ~10 indexed writes per purchase. Trimming recovered part of it: one dropped index that served no query, one merged action that was writing the same event twice, and tier_id removed from metadata. The rest is inherent to writing a full audit trail synchronously inside the purchase transaction — it is the feature, not a defect. Production would use an outbox: insert one cheap row into audit_outbox inside the transaction and let a worker expand it into the indexed audit_log asynchronously. NOT built — it adds a table, a worker, and new failure modes (the outbox draining behind, or being replayed twice) for a cost that has not yet capped throughput at this scale. Revisit if audit ever becomes the top entry in pg_stat_statements.
 
+GAP: deadlines shorter than the pool queue fail charged purchases → FIXED (rev. 6)
+
+Any deadline on work that waits for a pool connection must outlast the worst queue, which was 36s at 8,000 VUs. A 15s finish limit and 5s outcome limit returned 500s for purchases that had been charged; bookings stayed held, so the worker resolved them and no money was at risk. Found only by re-measuring the ceiling: a 2,000-VU regression never reached it, so any change to timeouts needs a run at 8,000. Current numbers: docs/load-test-results.md §10.
+
 GAP: Simulated provider is in-memory → DOCUMENT
 
 Restarting cmd/payment-service loses all charges, so reconciliation would see "never charged" for real charges. This is a property of the simulator, not the design: a real provider's ledger is durable. Tests and demos never restart the sim mid-scenario. The same applies to the AWS run: an ECS redeploy or task replacement of the payment service is a restart (terraform/README.md). Raised again by the Codex review (#8) and kept as a documented limit.

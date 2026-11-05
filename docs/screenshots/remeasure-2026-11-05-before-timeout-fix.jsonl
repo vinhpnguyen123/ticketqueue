@@ -1,0 +1,13 @@
+{"tag": "ceiling-500", "vus": 500, "tickets": 1000, "sold": 441, "rate": 104.0, "reqs": 500, "p50": 4.6, "p95": 4.67, "failed": 59, "server_error": 59, "unexpected": 0}
+{"tag": "ceiling-1000", "vus": 1000, "tickets": 2000, "sold": 1000, "rate": 154.2, "reqs": 1000, "p50": 6.08, "p95": 6.21, "failed": 0, "server_error": 0, "unexpected": 0}
+{"tag": "ceiling-2000", "vus": 2000, "tickets": 4000, "sold": 1731, "rate": 54.2, "reqs": 2000, "p50": 28.32, "p95": 32.44, "failed": 269, "server_error": 0, "unexpected": 269}
+{"tag": "ceiling-4000", "vus": 4000, "tickets": 8000, "sold": 3527, "rate": 78.1, "reqs": 4000, "p50": 46.98, "p95": 48.83, "failed": 473, "server_error": 473, "unexpected": 0}
+{"tag": "ceiling-8000", "vus": 8000, "tickets": 16000, "sold": 4840, "rate": 106.6, "reqs": 8000, "p50": 56.55, "p95": 58.84, "failed": 7014, "server_error": 6, "unexpected": 7008}
+{"tag": "ceiling-10000", "vus": 10000, "tickets": 100, "sold": 100, "rate": 567.0, "reqs": 10000, "p50": 11.41, "p95": 12.87, "failed": 0, "server_error": 0, "unexpected": 0}
+{"tag": "pool-a1", "vus": 2000, "tickets": 3000, "sold": 2000, "rate": 209.9, "reqs": 2000, "p50": 8.71, "p95": 8.94, "failed": 0, "server_error": 0, "unexpected": 0}
+{"tag": "pool-b1", "vus": 2000, "tickets": 3000, "sold": 2000, "rate": 158.7, "reqs": 2000, "p50": 11.52, "p95": 11.91, "failed": 0, "server_error": 0, "unexpected": 0}
+{"tag": "pool-c1", "vus": 2000, "tickets": 3000, "sold": 2000, "rate": 238.1, "reqs": 2000, "p50": 7.56, "p95": 7.93, "failed": 0, "server_error": 0, "unexpected": 0}
+{"tag": "pool-a2", "vus": 2000, "tickets": 3000, "sold": 2000, "rate": 144.7, "reqs": 2000, "p50": 11.89, "p95": 13.2, "failed": 0, "server_error": 0, "unexpected": 0}
+{"tag": "pool-b2", "vus": 2000, "tickets": 3000, "sold": 2000, "rate": 117.3, "reqs": 2000, "p50": 13.23, "p95": 16.11, "failed": 0, "server_error": 0, "unexpected": 0}
+{"tag": "pool-c2", "vus": 2000, "tickets": 3000, "sold": 2000, "rate": 215.6, "reqs": 2000, "p50": 8.49, "p95": 8.68, "failed": 0, "server_error": 0, "unexpected": 0}
+{"tag": "pool-a3", "vus": 2000, "tickets": 3000, "sold": 2000, "rate": 72.7, "reqs": 2000, "p50": 23.81, "p95": 25.66, "failed": 0, "server_error": 0, "unexpected": 0}

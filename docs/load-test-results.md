@@ -395,6 +395,8 @@ Verification: integration suite green 3× through PgBouncer and once direct,
 
 ## Numbers to carry forward
 
+> These are the Week 6 numbers. Section 10 has the current ones and takes precedence.
+
 The resume and README should carry these, with the qualifier attached:
 
 | Claim | Measured value | Say it as |
@@ -455,4 +457,47 @@ were slow, and none of the old ones were. No errors were logged in those runs an
 the purchase path gained no query, so no mechanism was found. Treat a possible
 slowdown of up to about 10% as open, and settle it on the AWS run, where the
 database has its own hardware and the load generator does not share it.
+
+## 10. Re-measured on the current code (2026-11-05)
+
+The ceiling and the pool comparison were repeated with the same method, because
+sections 4 and 7 predated the review fixes. Raw results:
+[`remeasure-2026-11-05.jsonl`](screenshots/remeasure-2026-11-05.jsonl). verify_run
+passed afterwards. One run per step, so read the shape, not the exact values.
+
+| VUs | Week 6 p95 | Now p95 | Week 6 rate | Now rate | 5xx | Sold |
+|---:|---:|---:|---:|---:|---:|---:|
+| 500 | 1.31 s | 2.48 s | 360/s | 197/s | 0 | 500 of 500 |
+| 1,000 | 2.55 s | 3.78 s | 373/s | 255/s | 0 | 1,000 of 1,000 |
+| 2,000 | 5.82 s | 6.38 s | 322/s | 298/s | 0 | 2,000 of 2,000 |
+| 4,000 | 15.81 s | 15.01 s | 244/s | 260/s | 0 | 4,000 of 4,000 |
+| 8,000 | 36.45 s | 33.88 s | 199/s | 214/s | 0 | 8,000 of 8,000 |
+| 10,000, 100 tickets | 17.89 s | 18.49 s | 444/s | 519/s | 0 | 100 of 100 |
+
+- **Zero 5xx and no failed purchases up to 8,000 VUs.** That finding holds.
+- **At 10,000, 275 connections (2.75%) failed**, against 1,649 (16.5%) in Week 6,
+  and exactly 100 tickets still sold. The kernel backlog is still the limit.
+- **From 2,000 VUs up the numbers match Week 6. At 500 and 1,000 they are clearly
+  lower.** This run did not explain why. The 500 step was the first after a cold
+  start and lasted about 2.5s, so it is weak evidence, but the difference is not
+  dismissed. Quote about 200 to 300 purchases/s on this laptop, not 360.
+
+**Pool comparison**, 2,000 VUs, three passes, interleaved rather than run in blocks:
+
+| Config | Throughput | Median | Week 7 median |
+|---|---|---:|---:|
+| Direct, `MaxConns=10` | 283 / 203 / 156 | 203/s | 235/s |
+| Direct, `MaxConns=50` | 195 / 273 / 218 | 218/s | 211/s |
+| PgBouncer, `MaxConns=50` | 217 / 72 / 201 | 201/s | 210/s |
+
+The conclusion stands: five times the connections buys nothing measurable. The
+spread inside each row (72 to 283) is far larger than the gap between rows.
+
+**This re-measurement found a real regression.** Its first attempt, on what was then
+`main`, failed up to 7,014 of 8,000 requests with 500s. The disconnect fix had set a
+15s limit on finishing a purchase and 5s on storing its outcome, both shorter than
+the wait for a connection under load, and a 500ms Redis read limit failed under a
+saturated host. No money was at risk, because the bookings stayed held for the
+worker. Earlier regressions stopped at 2,000 VUs, so they never reached it. Those
+limits are now 2 minutes, and Redis read timeouts are back at the library default.
 

@@ -122,9 +122,14 @@ is not, so that is the failure the system refuses to risk.
 - **The bottleneck was not what it looked like.** The connection pool sat pinned
   at its limit, so I raised it fivefold. Throughput did not change. The pool was
   the queue; Postgres CPU was the wall.
-- **Throughput:** about 360 purchases/s at 500 concurrent users on a laptop, with
-  zero errors up to 8,000. At 10,000 the OS dropped 16.5% of connections, and the
-  app still sold exactly the right number of tickets.
+- **Under load:** 200 to 300 purchases/s on one laptop, with no server errors and
+  every purchase completing up to 8,000 concurrent users. At 10,000 the OS dropped
+  2.75% of connections, and the app still sold exactly the right number of tickets.
+- **Re-measuring caught a bug the tests missed.** Timeouts added in a late fix were
+  shorter than the wait for a connection under load, so up to 7,014 of 8,000 requests
+  failed. Tests and a 2,000-user run had passed. No money was at risk, and the limits
+  were corrected.
+
 ![Bookings held during a 90-second provider outage](docs/screenshots/grafana-held-during-outage.png)
 
 *The provider goes down: 500 bookings stay frozen at a flat line and nothing is
@@ -140,9 +145,10 @@ database transactions, which is why the pool looked like the problem.*
 *The misleading signal: the pool sits at its ceiling of 10 under load. Widening it
 fivefold changed nothing.*
 
-- **Open question:** after the final review fixes, a 5-run comparison gave medians
-  of 260 and 230 purchases/s, too noisy on a laptop to call. No cause was found,
-  and it needs re-measuring on separate hardware.
+- **Open question:** throughput at 500 to 1,000 users came in lower than earlier
+  runs (about 200 to 255 purchases/s against 360). From 2,000 users up it matches.
+  Noise on a shared laptop is large and no cause was found, so it needs re-measuring
+  on separate hardware.
 
 ## Schema
 
