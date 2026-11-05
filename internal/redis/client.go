@@ -18,17 +18,15 @@ func NewClient(ctx context.Context, addr string) (*redis.Client, error) {
 	return client, nil
 }
 
-// options bounds every command. Redis is the fast path and every caller has an
-// answer for it being unavailable, so a hung Redis must fail quickly: with the
-// library defaults one command took 1m41s, past the ALB's 60s idle timeout, and
-// promotion would pay that once per admission. A healthy command takes under a
-// millisecond, so 500ms is far above normal load.
+// options bounds how long an unreachable Redis can hold a caller. The expensive
+// default is the dial path: 5s dials, retried 5 times, across 4 attempts took 1m41s
+// against an address that never answers. Read and write keep the library's 3s
+// default on purpose: a 500ms limit failed purchases when load saturated the host,
+// while a healthy Redis was merely being scheduled late.
 func options(addr string) *redis.Options {
 	return &redis.Options{
 		Addr:          addr,
-		DialTimeout:   500 * time.Millisecond,
-		ReadTimeout:   500 * time.Millisecond,
-		WriteTimeout:  500 * time.Millisecond,
+		DialTimeout:   time.Second,
 		MaxRetries:    1,
 		DialerRetries: 1,
 	}

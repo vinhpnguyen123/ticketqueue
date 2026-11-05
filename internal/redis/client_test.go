@@ -35,7 +35,30 @@ func TestHungRedisFailsFast(t *testing.T) {
 	if err == nil {
 		t.Fatal("command against a silent server succeeded")
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("failed after %v, want under 3s", elapsed)
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Errorf("failed after %v, want under 8s", elapsed)
+	}
+}
+
+// The dial path is where the defaults cost over a minute.
+func TestUnreachableRedisFailsFast(t *testing.T) {
+	opts := options("unused:6379")
+	opts.Dialer = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		select { // an address that never answers
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(opts.DialTimeout):
+			return nil, context.DeadlineExceeded
+		}
+	}
+	client := redis.NewClient(opts)
+	defer client.Close()
+
+	start := time.Now()
+	if err := client.ZCard(context.Background(), "queue:x").Err(); err == nil {
+		t.Fatal("command against an unreachable server succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Errorf("failed after %v, want under 8s", elapsed)
 	}
 }
