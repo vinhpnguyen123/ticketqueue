@@ -215,10 +215,11 @@ failure.
 | Drain, measured from restart | **93 s** |
 | verify_run | 9/9 PASS |
 
-The held count did **not** climb monotonically while the worker was dead: the
-webhook resolves dropped-response bookings through the API in about a second
-and needs no worker. Two independent recovery paths exist; killing one left the
-other working.
+The held count did **not** climb monotonically while the worker was dead, because
+most of it is healthy purchases between TX1 and TX2. **Correction (2026-11-04):**
+this section used to credit the webhook. That was wrong: the scenario never sets
+`WEBHOOK_URL`, and the Week 6 database shows the webhook resolved one booking in
+total. The peak of 347 above is held bookings of any kind, not stuck ones.
 
 ## 6. Known limitations of this benchmark
 
@@ -403,3 +404,30 @@ The resume and README should carry these, with the qualifier attached:
 | Recovery after a crash | **90–120 s** for one stranded booking (measured 105 s); backlog drains at **~100 bookings/min** (270 in 271 s, CHAOS 1) | Two numbers, always together |
 | Provider outage | **0** tickets released on a guess across 500 frozen bookings and 90 s; resolved 37 s after recovery | The money-rule sentence |
 | Worker outage | API kept confirming; 347-booking peak drained 93 s after restart | "The worker is a recovery path, not a dependency" |
+
+## 9. Regression after the review fixes (2026-11-04)
+
+Re-run after the Codex review fixes, which changed the hot path (provider key, a
+unique index on held bookings, promotion moved to Postgres). Same laptop, same
+harness, one run of each, so differences this small are within noise.
+
+| | Week 6 | After the fixes |
+|---|---|---|
+| Oversell, 2,000 VUs vs 100 tickets | 100 sold, 0 oversells | **100 sold, 0 oversells** |
+| Latency, 2,000 VUs vs 2,000 tickets, p50 / p95 | 6.26s / 6.48s | **6.49s / 6.62s** |
+| Throughput in that run | 289 purchases/s | **280 purchases/s** |
+| CHAOS 1, API killed | 270 stranded, 271s | 59 stranded, 151s |
+| CHAOS 2, provider down 90s | 500 frozen, 0 released, 37s | **500 frozen, 0 released, 24s** |
+| verify_run | all pass | **all pass** |
+
+The p95 < 2s k6 threshold fails at 2,000 VUs in both columns; it is written for
+500 VUs. CHAOS 1 stranded fewer bookings because a kill lands on whatever happens
+to be in flight, so the two rows are not a like-for-like speedup.
+
+CHAOS 3 failed its first run on one check, `HELD_PEAK >= HELD_AT_KILL`. That was
+a harness flaw, not a regression: at this load held bookings are mostly purchases
+between TX1 and TX2, so the check compared two random samples of traffic (426 at
+the kill, 286 at the peak). It now counts held bookings with an `unknown` payment,
+and the re-run passed with 23 of them waiting and a 207-booking backlog drained in
+122s. Both runs are kept in `docs/chaos/`.
+

@@ -103,6 +103,13 @@ curl -i http://$(terraform -chdir=terraform output -raw alb_dns_name)/metrics
                                   #    must still be up (it scrapes the task)
 ```
 
+**During a run, never redeploy or restart the payment-service task.** Its ledger
+is in memory (§17), so reconciliation would read real charges as "never charged"
+and release paid customers' tickets.
+
+**The load generator needs the stack's real `JWT_SECRET`.** `loadseed` signs
+tokens with it and refuses to start without one. Read it from Secrets Manager.
+
 Step 2 before step 4 is not optional. ECR repositories are created by
 `tf-apply`, so the very first run is a chicken-and-egg: apply once (services
 will fail to pull), then push, then apply again. After that, push first.

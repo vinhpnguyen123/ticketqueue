@@ -1,6 +1,6 @@
 TICKETQUEUE — IMPLEMENTATION PLAN (SOURCE OF TRUTH)
 
-Last updated: end of Week 6 (rev. 4 — see §18 for what changed). This document overrides any older summary, ERD image, or chat memory. When anything conflicts, THIS + the ./migrations files win.
+Last updated: Week 7, after the Codex review fixes (rev. 6 — see §18 for what changed). This document overrides any older summary, ERD image, or chat memory. When anything conflicts, THIS + the ./migrations files win.
 
 ═══════════════════════════════════════════
 
@@ -61,6 +61,8 @@ L1 is an optimization, not a guarantee. If Redis is wrong (lost compensation, cr
 
 Index note (migration 000010): idx_booking_reconciliation is on hold_expires_at, so it CANNOT serve the stuck-booking scans, which filter and order by created_at. idx_booking_stuck ON booking(created_at) WHERE status='held' exists for those — used by the reconciliation worker's hot-path scan and the admin stuck list.
 
+Index note (migrations 000015, 000016): idx_booking_idem is UNIQUE because booking.idempotency_key is the bridge to a global provider ledger. idx_booking_user_active is UNIQUE so the one-held-booking-per-user rule is enforced by the database, not by a read that two concurrent requests can both pass.
+
 payments reading rule: a booking that went through an ambiguous outcome and was later resolved legitimately keeps TWO payments rows — the 'unknown' row TX2 wrote as evidence of the attempt, and the 'succeeded'/'failed' row the resolver wrote. Current payment state = the most recent row with status <> 'unknown'; fall back to 'unknown' only when no resolved row exists. The 'unknown' row is audit history, never current state. Every admin view and reconciliation query must follow this rule.
 
 Rules:
@@ -111,7 +113,7 @@ Standard audit metadata keys (keep consistent):
 
 ═══════════════════════════════════════════
 
-booking.idempotency_key = the cross-system BRIDGE to the payment provider (charge time + reconciliation lookup). The only ID existing on both sides at every crash point.
+booking.idempotency_key = the cross-system BRIDGE to the payment provider (charge time + reconciliation lookup). The only ID existing on both sides at every crash point. A server-generated UUID per booking, NEVER the client's Idempotency-Key: a client key is unique only per user, the provider's ledger is global, and sharing one key let a second user receive the first user's charge. A retry never generates a new one, because the middleware replays or rejects it before the handler runs.
 idempotency_keys TABLE = HTTP-level dedup: request_hash (422 on mismatch), cached response replay, locked_at (serialize concurrent dupes), expires_at (cleanup). PK (key,user_id).
 
 ═══════════════════════════════════════════
@@ -120,7 +122,7 @@ idempotency_keys TABLE = HTTP-level dedup: request_hash (422 on mismatch), cache
 
 ═══════════════════════════════════════════ POST /v1/purchases (auth + idempotency middleware). Body: event_id, ticket_tier_id, quantity(1-10), payment_token, purchase_token(JWT).
 
-PHASE 1 — TX1: validate purchase_token → duplicate-charge guard (WHERE user_id AND status='held' → 410 active_booking_exists) → Lua decrement (→409 sold_out) → SELECT FOR UPDATE SKIP LOCKED claim (rows<qty → rollback + Redis compensate + 409) → INSERT booking 'held' (hold_expires_at NOW()+10min) → guarded ticket assignment (assert RowsAffected==qty) → audit → COMMIT (locks released).
+PHASE 1 — TX1: validate purchase_token → duplicate-charge guard (cheap read WHERE user_id AND status='held', then unique idx_booking_user_active at INSERT → 410 active_booking_exists) → sale check (event on_sale, tier inside sale_start/sale_end → 410 sales_closed) → total overflow check (422) → Lua decrement (→409 sold_out) → SELECT FOR UPDATE SKIP LOCKED claim (rows<qty → rollback + Redis compensate + 409) → INSERT booking 'held' (hold_expires_at NOW()+10min) → guarded ticket assignment (assert RowsAffected==qty) → audit → COMMIT (locks released).
 
 PHASE 2 — payment call, NO DB TX OPEN, 3s timeout, using booking.idempotency_key as the provider idempotency key.
 
@@ -139,14 +141,14 @@ All finalize paths (purchase TX2, reconciliation, hold-expiration, sync reconcil
 Workers that finish their work INSIDE one transaction (promotion, drift checker, idempotency cleanup) claim rows with FOR UPDATE SKIP LOCKED.
 Workers that call the payment provider (reconciliation, hold-expiration) scan with a PLAIN READ (no FOR UPDATE), call the provider with no transaction open, then finalize with guarded UPDATEs (WHERE status='held', assert RowsAffected). Holding a lock across the provider call would violate Principle #2. If two workers race on the same booking, the loser gets RowsAffected 0 and skips — safe because provider lookup is side-effect-free.
 ALL workers: guarded UPDATEs only, batch LIMIT per cycle, audit every state change with actor_type 'worker'.
-Promotion (5s) — Option-A capacity count (admitted+unexpired queue_entries) → ZPOPMIN batch → mark admitted + issue purchase_token, jitter 100-400ms → expired-window sweep.
+Promotion (5s) — Postgres decides who is next; Redis only mirrors it. Per admission, one transaction: per-event advisory lock → Option-A capacity count (admitted+unexpired queue_entries) → admit the earliest waiting row by joined_at (FOR UPDATE SKIP LOCKED) → audit → commit. Then ZREM (best effort), jitter 100-400ms outside any transaction. At most min(max_concurrent_windows, PromotionBatch=50) admissions per event per cycle → expired-window sweep. The purchase_token is minted when the user reads position. (Changed in rev. 6: ZPOPMIN removed users before admission committed, so a crash or SIGTERM mid-batch stranded them, and unserialized counts let concurrent workers overfill an event.)
 Hold-expiration (5s) — BUILT (internal/worker/holdexpiry.go, via booking.ReconcileBooking; §12 tests #7-#12). Held bookings past hold_expires_at → ask the provider by idempotency_key (shared ReconcileBooking, per-call 3s timeout, batch LIMIT so one cycle stays bounded):
 no charge / charge failed → FailBooking (release tickets, never touch 'sold') → Redis INCRBY after commit.
 charge succeeded → ConfirmBooking (tickets are still held by THIS booking, so confirming is safe).
 provider unreachable → defer: leave 'held', tickets stay held, audit expiry_deferred_provider_unreachable once. Never release on a guess (money rule, §3). (Changed in rev. 3 — previously released tickets without asking the provider. See §17.)
 Reconciliation (30s) — held bookings older than booking.StuckAfter (90s, the single source of truth, shared with sync-reconcile-on-retry) → lookup provider by idempotency_key → confirm / fail / defer. Never guess when provider unreachable. Uses shared ReconcileBooking → ConfirmBooking/FailBooking. BUILT: the resolver lives in internal/booking/reconcile.go (ReconcileBooking + LoadStuck; ConfirmBooking/FailBooking in finalize.go), and is called today by the reconciliation worker, the hold-expiration worker, and the admin manual-reconcile endpoint. All four callers are wired: reconciliation worker, hold-expiration worker, admin manual reconcile, and sync-reconcile-on-retry (GET /v1/bookings/{id}). Every caller passes Actor.Source ('purchase' | 'reconciliation' | 'hold_expiry' | 'admin_manual' | 'sync_retry'), which lands in the audit row's metadata — actor_type alone cannot tell two workers apart. Candidate scan uses idx_booking_stuck (migration 000010). In practice reconciliation resolves most stuck bookings at ~90s; hold-expiration is the hard-deadline backstop.
 Idempotency cleanup (10min) — delete expired keys (batched DELETE ... WHERE ctid IN (SELECT ... LIMIT n) to avoid long locks).
-Drift checker (60s) — BUILT (internal/worker/drift.go; §12 tests #11-#12). The only stateful worker: the two-cycle rule needs to remember the previous cycle's observation, so it is a DriftChecker struct rather than a plain function. Jobs are independent — one failing job is recovered, logged and does not cost the other two their turn. All three audit with actor_type 'worker' and metadata.source 'drift' (§9's rule; the same Actor.Source convention the finalize paths use). Three jobs, see §17 for details: a. Redis-vs-Postgres inventory: for each on_sale tier, compare inventory:{tier_id} to COUNT(tickets WHERE status='available'). Only correct Redis when the SAME drift is seen on two consecutive cycles (tolerates in-flight TX1s between Lua decrement and commit). Postgres value wins. Audit inventory_drift_corrected, increment inventory_drift_detected_total. b. Invariants (detect + alert, NEVER auto-fix): COUNT(tickets per tier) == quantity_total; no 'sold' ticket attached to a non-confirmed booking; no 'held' ticket attached to a failed/cancelled booking. Violation → audit invariant_violation + ERROR log. c. Abandoned-queue-entry safety sweep (§17): waiting entries on sold_out/closed/cancelled events → 'expired' + left_at, audited, then ZREM from the waiting set AFTER the Postgres write commits. The PRIMARY mechanism is event.ExpireWaitingEntries, which takes a pgx.Tx so it can only run inside the transaction that changes the event status; it has no caller yet because nothing in the codebase transitions an event today — it is the correct primitive waiting for the admin status endpoint. Job C is the safety net for paths that forget.
+Drift checker (60s) — BUILT (internal/worker/drift.go; §12 tests #11-#12). The only stateful worker: the two-cycle rule needs to remember the previous cycle's observation, so it is a DriftChecker struct rather than a plain function. Jobs are independent — one failing job is recovered, logged and does not cost the other two their turn. All three audit with actor_type 'worker' and metadata.source 'drift' (§9's rule; the same Actor.Source convention the finalize paths use). Four jobs, see §17 for details: a. Redis-vs-Postgres inventory: for each on_sale tier, compare inventory:{tier_id} to COUNT(tickets WHERE status='available'). Only correct Redis when the SAME drift is seen on two consecutive cycles (tolerates in-flight TX1s between Lua decrement and commit). Postgres value wins. Audit inventory_drift_corrected, increment inventory_drift_detected_total. b. Invariants (detect + alert, NEVER auto-fix): COUNT(tickets per tier) == quantity_total; no 'sold' ticket attached to a non-confirmed booking; no 'held' ticket attached to a failed/cancelled booking. Violation → audit invariant_violation + ERROR log. c. Abandoned-queue-entry safety sweep (§17): waiting entries on sold_out/closed/cancelled events → 'expired' + left_at, audited, then ZREM from the waiting set AFTER the Postgres write commits. The PRIMARY mechanism is event.ExpireWaitingEntries, which takes a pgx.Tx so it can only run inside the transaction that changes the event status; it has no caller yet because nothing in the codebase transitions an event today — it is the correct primitive waiting for the admin status endpoint. Job C is the safety net for paths that forget. d. Queue sync: queue.SyncFromPostgres makes every on_sale event's Redis set match its waiting rows. It never deletes the key: ZADD NX the missing, then re-check members against Postgres and ZREM the stale, so a lost Redis recovers within one cycle (and at startup) and a failed read changes nothing.
 
 ═══════════════════════════════════════════
 
@@ -282,8 +284,7 @@ DONE (extra, not originally planned) — end-to-end demo: scripts/demo_reconcili
 
 OUTSTANDING — in priority order:
 
- Prometheus + Grafana: add to docker-compose, instrument all three binaries per §11a, build the 4-row dashboard ← do BEFORE the Week 6 load test
- Integration suite covering §12 — all twelve scenarios now have tests.
+Nothing: Prometheus + Grafana and the §12 integration suite are both done (see the DONE list above).
 
 Mid-week checkpoint: if correctness fixes + orders API + admin + metrics are not done by mid-week, cut webhook and dashboard polish immediately (§14 #1 and #2). Don't wait for end of week.
 
@@ -293,17 +294,19 @@ WEEK 6 (load test + chaos) — DONE 2026-09-18. Canonical numbers live in docs/l
 - Latency (2,000-ticket tier, 2,000 VUs, 2,000 samples): purchase_completed_duration p50 6.26s / p95 6.48s / p99 6.52s, 289 purchases/s. Phase breakdown: tx1 42%, tx2 58%, payment_call 0.01% (5ms p95). Time is spent waiting for a DB connection, not on the provider. At 500 VUs: p95 815ms, every k6 threshold green.
 - Ceiling: throughput plateaus at ~350 purchases/s from 500 VUs. Clean (0 errors) to 8,000 VUs with p95 36s; at 10,000 the kernel (somaxconn=128) dropped 16.5% of connections and the app STILL sold exactly 100/100. What saturated first: pgxpool MaxConns=10 (db_pool_in_use pinned at 10 from 1,000 VUs; 14,895s cumulative acquire wait in the 2,000-VU run). Second: the macOS listen backlog. The app never produced a 5xx.
 - CHAOS 1 (API SIGKILL mid-load): 270 stranded, all resolved 271s after the kill — batch-limited at ReconcileBatch=50/30s ≈ 100 bookings/min; a single booking is still 90–120s. 9/9.
-aos switch now built): 500 bookings frozen, available count NEVER rose, 59 deferral audit rows on 59 bookings (one each across ~18 cycles), all resolved 37s after recovery. 9/9. The strongest correctness evidence in the project.
-- CHAOS 3 (worker SIGKILL 60s, 10% tok_drops_response): peak 347 unresolved, API kept confirming throughout, 80 left over drained 93s after restart. 9/9. Finding: the webhook resolves dropped-response bookings without the worker; the worker is the backstop.
+- CHAOS 2 (provider unreachable 90s, §10 chaos switch now built): 500 bookings frozen, available count NEVER rose, 59 deferral audit rows on 59 bookings (one each across ~18 cycles), all resolved 37s after recovery. 9/9. The strongest correctness evidence in the project.
+- CHAOS 3 (worker SIGKILL 60s, 10% tok_drops_response): peak 347 unresolved, API kept confirming throughout, 80 left over drained 93s after restart. 9/9. CORRECTED 2026-11-04: an earlier note credited the webhook here, but the scenario never sets WEBHOOK_URL and the webhook resolved one booking in total. "Peak 347" is held bookings of any kind, mostly purchases between TX1 and TX2; the worker is the only recovery path in this scenario.
 - Harness: SharedArray fix (per-VU JSON.parse of the seed was 9.3MB/VU and crashed the 8GB host at 2,000 VUs), RUN_ID unique per run (a constant collided with the previous run's idempotency keys → 422s), checkPurchase now recognises conflict/validation_failed and thresholds them to zero.
 - NOT done: Grafana screenshots (links with pinned windows in docs/screenshots/README.md). calibrate.js is dead code — a ramp prints one aggregate summary and cannot separate 2k from 8k; the ceiling table came from fixed-VU steps.
 
 LATER:
 
 Week 6 (as originally written, for the record): k6 load test (10k concurrent @ 100 tickets → exactly 100 sold, 0 oversells, measure P95); capture Grafana panels during the run (latency breakdown, pool saturation, recovery); chaos (kill API mid-load, reconciliation recovers; make provider unreachable, verify no tickets released on a guess). After the run, verify in SQL: sold tickets == confirmed booking quantities == succeeded payment amounts. NOTE: do NOT claim load numbers on resume until this runs.
-WEEK 7 (in progress) — DONE so far: Dockerfiles for all three binaries (multi-stage, distroless/static nonroot, git SHA in /health, in-binary -healthcheck because distroless has no shell), .dockerignore, PgBouncer transaction mode + pgx simple protocol behind PGBOUNCER=true, POOL_MAX_CONNS, compose `app` profile running the built images, make docker-build/docker-up/test-pgbouncer. Image sizes: payment-service 21.3MB, worker 30.9MB, api 33MB (target was <25MB for the api and it was MISSED — the Go binary alone is 19.3MiB stripped). NOT done: Terraform, deploy, demo video.
+WEEK 7 (in progress) — DONE so far: Dockerfiles for all three binaries (multi-stage, distroless/static nonroot, git SHA in /health, in-binary -healthcheck because distroless has no shell), .dockerignore, PgBouncer transaction mode + pgx simple protocol behind PGBOUNCER=true, POOL_MAX_CONNS, compose `app` profile running the built images, make docker-build/docker-up/test-pgbouncer. Image sizes: payment-service 21.3MB, worker 30.9MB, api 33MB (target was <25MB for the api and it was MISSED — the Go binary alone is 19.3MiB stripped). Terraform is written (not yet applied). NOT done: deploy, demo video.
 
-Week 7 (remaining): Terraform (VPC/RDS/ElastiCache/ECS/ALB/Secrets), deploy, demo video, tear down (~$15-30). Add PgBouncer (transaction mode; set pgx simple protocol to avoid prepared-statement breakage).
+CODEX REVIEW FIXES (rev. 6, 2026-11-04) — all 24 findings verified against the code; 23 fixed, #8 documented (§17). Plan and per-task detail: docs/superpowers/plans/2026-11-04-codex-review-fixes.md. CI now runs on every PR and push to main, and main is protected.
+
+Week 7 (remaining): deploy, demo video, tear down (~$15-30).
 Week 8: README (pitch, headline load result, Grafana screenshots, 3 headline diagrams, 13 problems, schema, privacy section, honest production-hardening section incl. §17 documented gaps), interview prep.
 
 ═══════════════════════════════════════════
@@ -352,7 +355,6 @@ The same session produced the reverse lesson about indexes that look dead. idx_a
 idx_audit_request both showed idx_scan = 0. One was genuinely unused and got dropped; the other
 is used by an admin endpoint the load tests never call. The scan counter measures what the
 workload exercised, not what the code needs. Grep before dropping.
-
 
 Controlling how many people enter a purchase window, and for how long
 
@@ -423,6 +425,7 @@ expires_at — allow key reuse. Idempotency keys usually expire (Stripe ~24h). I
 Audit log
 
 INDEX NOTES (updated 2026-09-19 after profiling with pg_stat_statements + EXPLAIN):
+
 - tickets: idx_tickets_claim_ordered(ticket_tier_id, id) WHERE status='available' — REPLACED idx_tickets_claim(ticket_tier_id, status). 'status' in a partial index that already filters on status is dead weight, and without id in the key the claim query's ORDER BY id had nothing to seek on: 48ms/41,667 buffers became 0.07ms/5 buffers. Costs 6.6x index size because a unique id defeats B-tree deduplication.
 - audit_log: idx_audit_recon_needed(entity_id) WHERE action='reconciliation_needed' — ADDED. 8 KB. Lets the stuck-bookings gauge start from audit_log instead of seq-scanning booking for `status <> 'confirmed'`, which is not indexable. 11,452 buffers -> 32.
 - audit_log: idx_audit_actor — DROPPED. grep confirmed nothing filters on actor_user_id. Recreate it if a "what did this admin do" query is ever added.
@@ -442,7 +445,6 @@ Problem: hold-expiration failed every held booking past hold_expires_at without 
 Interview line: "Hold expiry asks the provider before releasing, and defers when it can't
 reach them — releasing inventory for a booking that may have been charged is the one case
 where being fast is worse than being slow."
-
 
 GAP: Charged after booking failed (Outcome D) → PARTIAL FIX + DOCUMENT
 
@@ -504,7 +506,15 @@ Audit writes were 24.5% of database exec time, at ~10 indexed writes per purchas
 
 GAP: Simulated provider is in-memory → DOCUMENT
 
-Restarting cmd/payment-service loses all charges, so reconciliation would see "never charged" for real charges. This is a property of the simulator, not the design: a real provider's ledger is durable. Tests and demos never restart the sim mid-scenario.
+Restarting cmd/payment-service loses all charges, so reconciliation would see "never charged" for real charges. This is a property of the simulator, not the design: a real provider's ledger is durable. Tests and demos never restart the sim mid-scenario. The same applies to the AWS run: an ECS redeploy or task replacement of the payment service is a restart (terraform/README.md). Raised again by the Codex review (#8) and kept as a documented limit.
+
+GAP: "not found" from the provider is only a verdict on an old booking → FIXED (rev. 6)
+
+A provider still processing a charge has no record of it. ReconcileBooking now treats NotFound on a booking younger than booking.StuckAfter as in flight: nothing changes, and the caller reports it (admin 409 payment_may_be_in_flight, webhook 503). Reconciliation and hold-expiry were already safe through their scan age; the check sits in the shared resolver so no caller can skip it.
+
+GAP: a stale Redis member can show 'waiting' after admission → BOUNDED (rev. 6)
+
+Admission commits before ZREM, so a crash or failed ZREM leaves an admitted user in the set. Position reads the durable row when the user's rank is below max_concurrent_windows, and whenever Redis fails. Admission is FIFO, so stale members sit at the front, and everyone behind them stays on the Redis-only path, because Postgres CPU is the measured bottleneck (§17). Residual: if stale members ever outnumber max_concurrent_windows, the excess reads 'waiting' until the next queue sync (at most 60s).
 
 ═══════════════════════════════════════════
 
@@ -515,6 +525,9 @@ Restarting cmd/payment-service loses all charges, so reconciliation would see "n
 Added Prometheus + Grafana (§2, §11a, Week 5/6/8 tasks, cut line #2).
 Reconciliation scan changed to plain read (no FOR UPDATE across the provider call).
 Added fraud/anti-scalping gap (document only).
+
+rev. 6 (Week 7, Codex review fixes):
+Promotion moved to Postgres (§9). Provider key is a per-booking UUID (§7). Unique indexes for the provider key and one held booking per user (§6, migrations 000015-16). Queue sync added as drift job d (§9). Purchase checks sale state and total overflow (§8). "Not found" deferred on young bookings and stale-member handling (§17). Position can return null position and queue_size when Redis cannot answer. JWT_SECRET is required and locally generated into a git-ignored file; WEBHOOK_SECRET has no default; TRUSTED_PROXY_HOPS added; webhook signature covers the timestamp; verify_run exits 2 when a check could not run.
 
 rev. 5 (Week 7, local containerization):
 Three Dockerfiles (build/), PgBouncer in transaction mode, POOL_MAX_CONNS, internal/version + a -healthcheck probe in each binary. Proven locally before AWS: integration suite 3x green through PgBouncer, make demo PASS (110s), 500-VU storm clean, verify_run 9/9. §17: the "pool is the ceiling" gap from rev. 4 is CORRECTED (it is Postgres CPU), and three new gaps recorded. Measurements: docs/load-test-results.md §7-§8.
