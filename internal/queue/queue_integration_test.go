@@ -257,3 +257,59 @@ func TestLeaveDBFailureKeepsRedisMember(t *testing.T) {
 		t.Errorf("zcard = %d, err = %v, want 0", n, err)
 	}
 }
+
+func auditCount(t *testing.T, pool *pgxpool.Pool, eventID, action string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM audit_log WHERE entity_id = $1 AND action = $2`, eventID, action).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// Promotion reads Postgres, so once the row exists the user IS queued and can be
+// admitted. Reporting failure, or losing the audit row, would both be false.
+func TestJoinSucceedsAndAuditsWithRedisDown(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := createEvent(t, pool, "on_sale")
+	userID := createUsers(t, pool, 1)[0]
+	dead := redis.NewClient(&redis.Options{Addr: "localhost:1"})
+	defer dead.Close()
+
+	pos, already, err := queue.Join(ctx, dead, pool, userID, eventID)
+	if err != nil || already || pos != 0 {
+		t.Fatalf("join = pos %d already %v err %v, want 0, false, nil", pos, already, err)
+	}
+	if got := auditCount(t, pool, eventID, "queue_joined"); got != 1 {
+		t.Errorf("queue_joined rows = %d, want 1", got)
+	}
+
+	pos, already, err = queue.Join(ctx, rdb, pool, userID, eventID)
+	if err != nil || !already || pos != 1 {
+		t.Fatalf("retry = pos %d already %v err %v, want 1, true, nil", pos, already, err)
+	}
+	if got := auditCount(t, pool, eventID, "queue_joined"); got != 1 {
+		t.Errorf("queue_joined rows after retry = %d, want 1", got)
+	}
+}
+
+func TestLeaveAuditsWithRedisDown(t *testing.T) {
+	pool := testutil.TestDB(t)
+	rdb := testutil.TestRedis(t)
+	ctx := context.Background()
+	eventID := createEvent(t, pool, "on_sale")
+	users := createUsers(t, pool, 1)
+	joinAll(t, pool, rdb, eventID, users)
+	dead := redis.NewClient(&redis.Options{Addr: "localhost:1"})
+	defer dead.Close()
+
+	if err := queue.Leave(ctx, dead, pool, users[0], eventID); err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	if got := auditCount(t, pool, eventID, "queue_left"); got != 1 {
+		t.Errorf("queue_left rows = %d, want 1", got)
+	}
+}

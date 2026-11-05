@@ -387,3 +387,28 @@ func TestPositionStaleMemberOfDepartedUserIsNotFound(t *testing.T) {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
 }
+
+func TestQueueJoinRedisDownReportsNullPosition(t *testing.T) {
+	ts, pool, _ := newQueueServer(t)
+	eventID := seedEvent(t, pool, "Queue Concert", "on_sale", nil)
+	_, tok := registerUser(t, ts, "join-down@test.dev")
+
+	dead := redis.NewClient(&redis.Options{Addr: "localhost:1"})
+	t.Cleanup(func() { dead.Close() })
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	api.NewQueueHandler(pool, dead, testSecret).Mount(r)
+	down := httptest.NewServer(r)
+	t.Cleanup(down.Close)
+
+	var out struct {
+		Data map[string]any `json:"data"`
+	}
+	resp := doQueue(t, http.MethodPost, fmt.Sprintf("%s/v1/events/%s/queue/join", down.URL, eventID), tok, &out)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d body=%v, want 201", resp.StatusCode, out.Data)
+	}
+	if out.Data["position"] != nil || out.Data["queue_size"] != nil {
+		t.Errorf("body = %v, want null position and queue_size", out.Data)
+	}
+}

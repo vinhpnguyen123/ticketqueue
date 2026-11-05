@@ -38,19 +38,23 @@ func Key(eventID string) string {
 // alreadyInQueue is true when the user had an active entry before this call
 // (the join is idempotent — callers use this to pick 200 vs 201).
 //
-// Postgres is written FIRST, then Redis: the durable record must exist
-// before the fast path. If the Redis write fails after the Postgres insert,
-// SyncFromPostgres will restore the member; if Postgres fails, nothing
-// entered Redis, so there is no ghost queue member that would vanish on the
-// next rebuild.
+// The Postgres row, written with its audit row in one transaction, is the join:
+// promotion reads Postgres, so from that commit the user is queued. Redis only
+// serves position reads, so a Redis failure afterwards is not a failed join. It
+// returns position 0, meaning unknown, and SyncFromPostgres restores the member.
 func Join(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, eventID string) (position int64, alreadyInQueue bool, err error) {
 	var joinedAt time.Time
-	err = db.QueryRow(ctx,
-		`INSERT INTO queue_entries (user_id, event_id, status)
-		 VALUES ($1, $2, 'waiting')
-		 RETURNING joined_at`,
-		userID, eventID,
-	).Scan(&joinedAt)
+	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO queue_entries (user_id, event_id, status)
+			 VALUES ($1, $2, 'waiting')
+			 RETURNING joined_at`,
+			userID, eventID,
+		).Scan(&joinedAt); err != nil {
+			return err
+		}
+		return audit(ctx, tx, userID, eventID, "queue_joined")
+	})
 
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -79,16 +83,17 @@ func Join(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, even
 		Score:  float64(joinedAt.UnixMicro()),
 		Member: userID,
 	}).Err(); err != nil {
-		return 0, false, fmt.Errorf("zadd queue member: %w", err)
+		slog.Warn("zadd after join failed", "user_id", userID, "event_id", eventID, "error", err)
+		return 0, alreadyInQueue, nil
 	}
 
+	// redis.Nil is a promotion that admitted this user just now, not a failure.
 	rank, err := rdb.ZRank(ctx, Key(eventID), userID).Result()
 	if err != nil {
-		return 0, false, fmt.Errorf("zrank queue member: %w", err)
-	}
-
-	if !alreadyInQueue {
-		audit(ctx, db, userID, eventID, "queue_joined")
+		if !errors.Is(err, redis.Nil) {
+			slog.Warn("zrank after join failed", "user_id", userID, "event_id", eventID, "error", err)
+		}
+		return 0, alreadyInQueue, nil
 	}
 	return rank + 1, alreadyInQueue, nil
 }
@@ -122,16 +127,22 @@ func Size(ctx context.Context, rdb *redis.Client, eventID string) (int64, error)
 // agreeing the user is still queued, so a retry is safe. Returns ErrNotInQueue
 // when no active row exists.
 func Leave(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, eventID string) error {
-	tag, err := db.Exec(ctx,
-		`UPDATE queue_entries SET status = 'left', left_at = NOW()
-		 WHERE user_id = $1 AND event_id = $2 AND status IN ('waiting', 'admitted')`,
-		userID, eventID,
-	)
+	err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`UPDATE queue_entries SET status = 'left', left_at = NOW()
+			 WHERE user_id = $1 AND event_id = $2 AND status IN ('waiting', 'admitted')`,
+			userID, eventID,
+		)
+		if err != nil {
+			return fmt.Errorf("update queue entry: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotInQueue
+		}
+		return audit(ctx, tx, userID, eventID, "queue_left")
+	})
 	if err != nil {
-		return fmt.Errorf("update queue entry: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotInQueue
+		return err
 	}
 
 	// The leave is durable from here, so this is not the caller's failure: the
@@ -139,8 +150,6 @@ func Leave(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, userID, eve
 	if err := rdb.ZRem(ctx, Key(eventID), userID).Err(); err != nil {
 		slog.Error("zrem after leave failed", "user_id", userID, "event_id", eventID, "error", err)
 	}
-
-	audit(ctx, db, userID, eventID, "queue_left")
 	return nil
 }
 
@@ -228,13 +237,15 @@ func SyncFromPostgres(ctx context.Context, rdb *redis.Client, db *pgxpool.Pool, 
 	return nil
 }
 
-func audit(ctx context.Context, db *pgxpool.Pool, userID, eventID, action string) {
-	if _, err := db.Exec(ctx,
+// audit runs inside the caller's transaction, so a state change and its audit
+// row commit or roll back together.
+func audit(ctx context.Context, tx pgx.Tx, userID, eventID, action string) error {
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO audit_log (entity_type, entity_id, action, actor_type, actor_user_id, request_id)
 		 VALUES ('event', $1, $2, 'user', $3, $4)`,
 		eventID, action, userID, middleware.GetReqID(ctx),
 	); err != nil {
-		// Audit failures never fail the queue operation.
-		slog.Error("audit log insert failed", "action", action, "error", err)
+		return fmt.Errorf("audit %s: %w", action, err)
 	}
+	return nil
 }

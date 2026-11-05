@@ -93,11 +93,15 @@ func (h *QueueHandler) Join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, size, _, err := queue.Position(r.Context(), h.rdb, userID, e.ID)
-	if err != nil {
-		slog.Error("queue: size after join", "error", err)
-		response.Error(w, r, http.StatusInternalServerError, "internal", "failed to join queue")
-		return
+	// Null, not 0, when Redis cannot say: the join itself has succeeded.
+	var positionOut, sizeOut any
+	if position > 0 {
+		positionOut = position
+		if _, size, _, err := queue.Position(r.Context(), h.rdb, userID, e.ID); err != nil {
+			slog.Warn("queue: size after join unavailable", "error", err)
+		} else {
+			sizeOut = size
+		}
 	}
 
 	var joinedAt time.Time
@@ -116,8 +120,8 @@ func (h *QueueHandler) Join(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK // idempotent re-join is not an error
 	}
 	response.JSON(w, r, status, map[string]any{
-		"position":   position,
-		"queue_size": size,
+		"position":   positionOut,
+		"queue_size": sizeOut,
 		"joined_at":  joinedAt,
 	})
 }
