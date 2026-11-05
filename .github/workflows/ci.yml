@@ -48,6 +48,7 @@ jobs:
         run: |
           bash scripts/verify_run_selftest.sh
           bash scripts/tf_migrate_selftest.sh
+          node scripts/site_check.mjs
       - name: unit tests
         run: make test
       - name: migrate test database
