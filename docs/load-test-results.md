@@ -501,3 +501,18 @@ saturated host. No money was at risk, because the bookings stayed held for the
 worker. Earlier regressions stopped at 2,000 VUs, so they never reached it. Those
 limits are now 2 minutes, and Redis read timeouts are back at the library default.
 
+### Demo and chaos on the final code
+
+Re-run after the timeout fix, on the code now on `main`. All passed, and verify_run
+passed afterwards.
+
+| Scenario | Result |
+|---|---|
+| Demo, lost payment response | Recovered in 114s with no user action |
+| CHAOS 1, API killed | 279 stranded, all resolved 264s after the kill, no money discrepancy |
+| CHAOS 2, provider down 90s | 500 frozen, 0 released on a guess, all resolved within 31s of recovery |
+| CHAOS 3, worker killed | API kept serving; 34 left over, drained after restart |
+
+CHAOS 2 has recovered in 24s, 39s and 31s across the last three runs, so quote
+"within 39 seconds". CHAOS 1 varies by run because a kill lands on whatever is in flight.
+
