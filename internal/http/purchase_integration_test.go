@@ -986,3 +986,41 @@ func TestOversizedBodyRejected(t *testing.T) {
 		t.Errorf("idempotency claims = %d, want 0", claims)
 	}
 }
+
+// TX1 committed, so the booking exists and the charge may land. A disconnect
+// must not abandon it halfway: the attempt is recorded and a retry can read it.
+func TestPurchaseClientDisconnectFinishesTheAttempt(t *testing.T) {
+	ts, pool, _ := newPurchaseServer(t)
+	ctx := context.Background()
+	eventID, tierID := seedTier(t, pool, 1000, 5)
+	userID, jwtTok, purchaseTok := admittedUser(t, pool, eventID, 1)
+	body := purchaseBodyTok(eventID, tierID, 1, purchaseTok, "tok_slow_5s")
+	raw, _ := json.Marshal(body)
+
+	clientCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(clientCtx, http.MethodPost, ts.URL+"/v1/purchases", bytes.NewReader(raw))
+	req.Header.Set("Authorization", "Bearer "+jwtTok)
+	req.Header.Set("Idempotency-Key", "gave-up")
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("request finished before the client gave up")
+	}
+
+	waitFor(t, "the attempt to be recorded", func() bool {
+		var n int
+		pool.QueryRow(ctx, `SELECT COUNT(*) FROM payments p JOIN booking b ON b.id = p.booking_id
+		                    WHERE b.user_id = $1 AND p.status = 'unknown'`, userID).Scan(&n)
+		return n == 1
+	})
+	waitFor(t, "the outcome to be stored", func() bool {
+		var done bool
+		pool.QueryRow(ctx, `SELECT completed_at IS NOT NULL FROM idempotency_keys WHERE user_id = $1`, userID).Scan(&done)
+		return done
+	})
+
+	resp, out := purchase(t, ts, jwtTok, "gave-up", body)
+	if resp.Header.Get("Idempotency-Replayed") != "true" || resp.StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("retry = %d replayed=%q body=%v, want the stored 504", resp.StatusCode, resp.Header.Get("Idempotency-Replayed"), out)
+	}
+}

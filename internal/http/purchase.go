@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -72,6 +73,9 @@ func (req *purchaseRequest) validate() map[string]any {
 	}
 	return problems
 }
+
+// finishTimeout bounds the charge and TX2 once the request context may be gone.
+const finishTimeout = 15 * time.Second
 
 func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	userID, ok := auth.UserIDFromContext(r.Context())
@@ -203,17 +207,22 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	idempotency.SetBookingID(r, held.BookingID)
 	// --- End PHASE 1 (TX1). All row locks released at COMMIT above. ---
 
+	// From here the booking exists and a charge may land, so a client giving up
+	// must not abandon the attempt halfway. The charge has its own 3s timeout.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), finishTimeout)
+	defer cancel()
+
 	// --- PHASE 2: the payment call. NO DB transaction is open here — we never
 	// hold locks across a network call. Charge classifies every outcome
 	// (succeeded / declined / ambiguous) so PHASE 3 branches in one place.
 	payStart := time.Now()
-	charge := h.payments.Charge(r.Context(), providerKey, held.TotalCents, held.Currency, req.PaymentToken)
+	charge := h.payments.Charge(ctx, providerKey, held.TotalCents, held.Currency, req.PaymentToken)
 	metrics.PurchasePhase.WithLabelValues(metrics.PhasePaymentCall).Observe(time.Since(payStart).Seconds())
 
 	// --- PHASE 3: TX2 finalization based on the payment outcome.
-	reqID := middleware.GetReqID(r.Context())
+	reqID := middleware.GetReqID(ctx)
 	tx2Start := time.Now()
-	fin, err := booking.Finalize(r.Context(), h.pool, held, tier.ID, userID, reqID, charge)
+	fin, err := booking.Finalize(ctx, h.pool, held, tier.ID, userID, reqID, charge)
 	metrics.PurchasePhase.WithLabelValues(metrics.PhaseTX2).Observe(time.Since(tx2Start).Seconds())
 	if err != nil {
 		slog.Error("purchase: TX2 finalize failed", "booking_id", held.BookingID, "error", err)
@@ -236,7 +245,7 @@ func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 		// commit, never inside the transaction. ReleaseQty is 0 when the expiry
 		// worker already compensated (the lost-guard race).
 		if fin.ReleaseQty > 0 {
-			if cerr := booking.CompensateInventory(r.Context(), h.rdb, tier.ID, fin.ReleaseQty); cerr != nil {
+			if cerr := booking.CompensateInventory(ctx, h.rdb, tier.ID, fin.ReleaseQty); cerr != nil {
 				slog.Error("purchase: decline inventory compensation failed (drift checker will heal)",
 					"tier_id", tier.ID, "qty", fin.ReleaseQty, "error", cerr)
 			}
