@@ -74,8 +74,12 @@ func (req *purchaseRequest) validate() map[string]any {
 	return problems
 }
 
-// finishTimeout bounds the charge and TX2 once the request context may be gone.
-const finishTimeout = 15 * time.Second
+// finishTimeout only stops a stuck purchase living forever once the request
+// context may be gone. It must outlast the worst wait for a pool connection, or
+// load itself fails purchases that were charged: 15s here returned 500s at 2,000+
+// VUs, where the queue for a connection reached 36s. The charge has its own 3s
+// timeout.
+const finishTimeout = 2 * time.Minute
 
 func (h *PurchaseHandler) Create(w http.ResponseWriter, r *http.Request) {
 	userID, ok := auth.UserIDFromContext(r.Context())

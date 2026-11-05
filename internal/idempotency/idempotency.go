@@ -27,8 +27,10 @@ import (
 // Older than this and the original attempt is presumed dead.
 const lockTimeout = 30 * time.Second
 
-// persistTimeout bounds storing the outcome once the request context is gone.
-const persistTimeout = 5 * time.Second
+// persistTimeout bounds storing the outcome once the request context is gone. It
+// queues for a pool connection like everything else, so it must outlast the worst
+// wait: a short limit silently left outcomes unstored under load.
+const persistTimeout = 2 * time.Minute
 
 type ctxKey int
 
